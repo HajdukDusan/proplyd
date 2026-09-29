@@ -1,0 +1,240 @@
+syntax = "proto3";
+
+package proplyd.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/c12s/proplyd/api/proplydpb;proplydpb";
+
+// CacheService is the centralized cache used by c12s services.
+//
+// Every service registers a namespace once, describing the read, write and
+// eviction strategy it wants. All data operations are scoped to a namespace.
+// The cache talks to the backing store (etcd) directly; clients only access the
+// store themselves when the cache is unreachable (see client package docs).
+service CacheService {
+  // RegisterNamespace creates a namespace, or attaches to an existing one.
+  // Registering an existing namespace with a different configuration fails
+  // with FAILED_PRECONDITION.
+  rpc RegisterNamespace(RegisterNamespaceRequest) returns (RegisterNamespaceResponse);
+
+  // Get returns the value of a key. With READ_THROUGH and REFRESH_AHEAD the
+  // cache loads missing keys from the backing store itself; with CACHE_ASIDE
+  // a miss is reported back and the client is responsible for loading + Fill.
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Set writes a key according to the namespace write strategy.
+  rpc Set(SetRequest) returns (SetResponse);
+
+  // Delete removes a key according to the namespace write strategy.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Fill populates the cache with a value the client read from the backing
+  // store (cache-aside). Fills older than a change the cache already knows
+  // about are rejected, so a slow reader can never overwrite newer data.
+  rpc Fill(FillRequest) returns (FillResponse);
+
+  // Invalidate drops keys from the cache without touching the backing store.
+  rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
+
+  // Purge drops every cached key of a namespace. Pending write-behind entries
+  // are kept and still flushed.
+  rpc Purge(PurgeRequest) returns (PurgeResponse);
+
+  // Stats returns counters for a namespace.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+enum ReadStrategy {
+  READ_STRATEGY_UNSPECIFIED = 0; // defaults to READ_THROUGH
+  // Client loads from the store on a miss and calls Fill.
+  READ_STRATEGY_CACHE_ASIDE = 1;
+  // Cache loads from the store on a miss (deduplicated per key).
+  READ_STRATEGY_READ_THROUGH = 2;
+  // Read-through, plus entries older than refresh_after are reloaded in the
+  // background while the cached value keeps being served.
+  READ_STRATEGY_REFRESH_AHEAD = 3;
+}
+
+enum WriteStrategy {
+  WRITE_STRATEGY_UNSPECIFIED = 0; // defaults to WRITE_THROUGH
+  // Cache writes to the store, then updates itself. The write fails if the
+  // cache is unreachable: the cache never diverges from the store, but a
+  // write can be rejected.
+  WRITE_STRATEGY_WRITE_THROUGH = 1;
+  // Cache writes to the store and invalidates its entry. If the cache is
+  // unreachable the client writes to the store directly: every write is
+  // recorded, but the cache can briefly serve older data (see sync_mode).
+  WRITE_STRATEGY_WRITE_AROUND = 2;
+  // Cache acknowledges immediately and flushes to the store asynchronously in
+  // batches. Writes not yet flushed are LOST if the cache process dies.
+  WRITE_STRATEGY_WRITE_BEHIND = 3;
+}
+
+enum EvictionPolicy {
+  EVICTION_POLICY_UNSPECIFIED = 0; // defaults to SIEVE
+  EVICTION_POLICY_LRU = 1;
+  EVICTION_POLICY_LFU = 2;
+  // TINY_LFU and W_TINY_LFU are strongly admission-filtered in samber/hot
+  // v0.13 and keep far fewer entries than their capacity.
+  EVICTION_POLICY_TINY_LFU = 3;
+  EVICTION_POLICY_W_TINY_LFU = 4;
+  EVICTION_POLICY_TWO_QUEUE = 5;
+  // Rejected at registration: samber/hot v0.13 ARC does not bound memory.
+  EVICTION_POLICY_ARC = 6;
+  EVICTION_POLICY_FIFO = 7;
+  EVICTION_POLICY_SIEVE = 8;
+}
+
+// SyncMode controls whether the cache watches the backing store for changes
+// it did not make itself (direct client writes during an outage, other
+// writers) and updates its entries accordingly.
+enum SyncMode {
+  // WATCH for WRITE_AROUND namespaces, NONE otherwise.
+  SYNC_MODE_UNSPECIFIED = 0;
+  SYNC_MODE_WATCH = 1;
+  // Staleness caused by out-of-band writes is bounded by the TTL only.
+  SYNC_MODE_NONE = 2;
+}
+
+message WriteBehindConfig {
+  // How often dirty entries are flushed. Default 100ms.
+  google.protobuf.Duration flush_interval = 1;
+  // Maximum number of keys per store transaction. Default 128.
+  int32 max_batch = 2;
+  // Maximum number of unflushed keys; further writes fail with
+  // RESOURCE_EXHAUSTED until the flusher catches up. Default 100000.
+  int64 max_pending = 3;
+}
+
+message NamespaceConfig {
+  ReadStrategy read_strategy = 1;
+  WriteStrategy write_strategy = 2;
+  EvictionPolicy eviction_policy = 3;
+  // Maximum number of cached keys. Default 10000.
+  int64 capacity = 4;
+  // Default entry TTL. Zero means entries only leave through eviction.
+  google.protobuf.Duration ttl = 5;
+  // Prefix under which the namespace keys live in the backing store,
+  // e.g. "/magnetar/nodes/". Required.
+  string key_prefix = 6;
+  // REFRESH_AHEAD only: entries older than this are refreshed in the
+  // background. Default 75% of ttl.
+  google.protobuf.Duration refresh_after = 7;
+  WriteBehindConfig write_behind = 8;
+  SyncMode sync_mode = 9;
+  // Cache "key does not exist" answers (negative caching).
+  bool cache_misses = 10;
+  // Maximum accepted value size in bytes. Default 1 MiB.
+  int64 max_value_bytes = 11;
+}
+
+message RegisterNamespaceRequest {
+  string namespace = 1;
+  NamespaceConfig config = 2;
+}
+
+message RegisterNamespaceResponse {
+  // Effective configuration with defaults applied.
+  NamespaceConfig config = 1;
+  // Identifies the cache process; changes when the cache restarts.
+  string epoch = 2;
+  // True if the namespace was created by this call.
+  bool created = 3;
+}
+
+enum Outcome {
+  OUTCOME_UNSPECIFIED = 0;
+  // Answered from memory.
+  OUTCOME_HIT = 1;
+  // Not cached; loaded from the backing store by the cache.
+  OUTCOME_LOADED = 2;
+  // Not cached and not loaded (CACHE_ASIDE): the client must load it.
+  OUTCOME_MISS = 3;
+}
+
+message GetRequest {
+  string namespace = 1;
+  string key = 2;
+}
+
+message GetResponse {
+  Outcome outcome = 1;
+  // Whether the key exists. Meaningless when outcome is MISS.
+  bool found = 2;
+  bytes value = 3;
+  // Store revision that last modified the key. 0 for write-behind values
+  // that have not been flushed yet.
+  int64 mod_revision = 4;
+}
+
+message SetRequest {
+  string namespace = 1;
+  string key = 2;
+  bytes value = 3;
+  // Overrides the namespace TTL for this key.
+  google.protobuf.Duration ttl = 4;
+}
+
+message SetResponse {
+  // Store revision of the write. 0 for write-behind.
+  int64 revision = 1;
+}
+
+message DeleteRequest {
+  string namespace = 1;
+  string key = 2;
+}
+
+message DeleteResponse {
+  int64 revision = 1;
+}
+
+message FillRequest {
+  string namespace = 1;
+  string key = 2;
+  bool found = 3;
+  bytes value = 4;
+  // Revision that last modified the key (0 if not found).
+  int64 mod_revision = 5;
+  // Store revision at which the read was served.
+  int64 read_revision = 6;
+  google.protobuf.Duration ttl = 7;
+}
+
+message FillResponse {
+  bool accepted = 1;
+}
+
+message InvalidateRequest {
+  string namespace = 1;
+  repeated string keys = 2;
+}
+
+message InvalidateResponse {}
+
+message PurgeRequest {
+  string namespace = 1;
+}
+
+message PurgeResponse {}
+
+message StatsRequest {
+  string namespace = 1;
+}
+
+message StatsResponse {
+  int64 entries = 1;
+  uint64 hits = 2;
+  uint64 misses = 3;
+  uint64 loads = 4;
+  uint64 load_errors = 5;
+  uint64 fills_accepted = 6;
+  uint64 fills_rejected = 7;
+  int64 pending_writes = 8;
+  uint64 flushed_writes = 9;
+  uint64 flush_errors = 10;
+  uint64 watch_events = 11;
+  uint64 watch_resyncs = 12;
+  uint64 refreshes = 13;
+}
