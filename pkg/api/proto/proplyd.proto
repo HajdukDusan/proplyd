@@ -1,0 +1,209 @@
+syntax = "proto3";
+
+package proplyd.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/c12s/proplyd/pkg/api";
+
+// Cache is the central proplyd cache. It sits in front of the backing store
+// (etcd), keeps cached entries in Redis and streams invalidations to the
+// near-caches of its clients.
+//
+// Errors carry a google.rpc.ErrorInfo detail with domain "proplyd.c12s.io"
+// and one of the reasons listed in the protocol package (for example
+// NAMESPACE_NOT_FOUND or BACKEND_UNAVAILABLE).
+service CacheService {
+  // Register creates a namespace or verifies that an existing one has the
+  // same spec. Registering is idempotent; a different spec is rejected with
+  // NAMESPACE_CONFLICT.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Get reads a key. With read-through and refresh-ahead a miss is loaded
+  // from the backing store. With cache-aside a miss is reported and the
+  // client is expected to load the value itself and call Fill.
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Fill installs a value the client loaded from the backing store
+  // (cache-aside). It is ignored when the cache already knows of a newer
+  // change to the key.
+  rpc Fill(FillRequest) returns (FillResponse);
+
+  // Set writes a key to the backing store and updates (write-through) or
+  // invalidates (write-around) the cached entry.
+  rpc Set(SetRequest) returns (SetResponse);
+
+  // Delete removes a key from the backing store and the cache.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Invalidate drops a cached entry (and the near-cache copies) without
+  // touching the backing store.
+  rpc Invalidate(InvalidateRequest) returns (InvalidateResponse);
+
+  // Subscribe streams invalidations of a namespace. A subscriber that passes
+  // the epoch and position of the last event it saw resumes without losing
+  // events; if that is not possible the first event is a reset.
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
+
+enum ReadStrategy {
+  READ_STRATEGY_UNSPECIFIED = 0;
+  // The cache loads misses from the backing store.
+  READ_STRATEGY_READ_THROUGH = 1;
+  // The cache reports misses; the client loads and calls Fill.
+  READ_STRATEGY_CACHE_ASIDE = 2;
+  // Read-through, and entries close to expiry are reloaded in the
+  // background while the cached value keeps being served.
+  READ_STRATEGY_REFRESH_AHEAD = 3;
+}
+
+enum WriteStrategy {
+  WRITE_STRATEGY_UNSPECIFIED = 0;
+  // The cache writes the backing store, then caches the new value.
+  WRITE_STRATEGY_WRITE_THROUGH = 1;
+  // The cache writes the backing store and invalidates the cached entry.
+  WRITE_STRATEGY_WRITE_AROUND = 2;
+  reserved 3; // WRITE_BEHIND, not implemented yet.
+}
+
+enum SyncMode {
+  SYNC_MODE_UNSPECIFIED = 0;
+  // Follow the backing store's change stream so that writes that bypass the
+  // cache (client fallback, other services) invalidate cached entries.
+  SYNC_MODE_WATCH = 1;
+  // Only writes made through the cache invalidate entries.
+  SYNC_MODE_NONE = 2;
+}
+
+message NamespaceSpec {
+  ReadStrategy read = 1;
+  WriteStrategy write = 2;
+  SyncMode sync = 3;
+  // Backing store key prefix of the namespace. Keys sent by clients are
+  // relative to it.
+  string key_prefix = 4;
+  // Lifetime of cached values in Redis.
+  google.protobuf.Duration ttl = 5;
+  // Lifetime of cached "key does not exist" entries. Zero disables negative
+  // caching.
+  google.protobuf.Duration negative_ttl = 6;
+  // Refresh-ahead only: entries older than this are reloaded in the
+  // background.
+  google.protobuf.Duration refresh_after = 7;
+}
+
+message RegisterRequest {
+  string namespace = 1;
+  NamespaceSpec spec = 2;
+}
+
+message RegisterResponse {
+  // The registered spec with defaults applied.
+  NamespaceSpec spec = 1;
+}
+
+enum Source {
+  SOURCE_UNSPECIFIED = 0;
+  // Served from the cache.
+  SOURCE_CACHE = 1;
+  // Loaded from the backing store for this request.
+  SOURCE_BACKEND = 2;
+}
+
+message GetRequest {
+  string namespace = 1;
+  string key = 2;
+  // The caller knows the key changed at this revision (typically its own
+  // write). A cached entry older than that is treated as a miss.
+  int64 min_revision = 3;
+}
+
+message GetResponse {
+  // Cache-aside only: the key is not cached; load it and call Fill.
+  bool miss = 1;
+  // Whether the key exists in the backing store.
+  bool found = 2;
+  bytes value = 3;
+  // Revision of the returned state: the backing store mod revision of a
+  // value, or the revision at which absence was observed.
+  int64 revision = 4;
+  Source source = 5;
+}
+
+message FillRequest {
+  string namespace = 1;
+  string key = 2;
+  bool found = 3;
+  bytes value = 4;
+  // Mod revision of the value (0 when not found).
+  int64 mod_revision = 5;
+  // Backing store revision at which the value was read.
+  int64 read_revision = 6;
+}
+
+message FillResponse {
+  // False when the fill was stale and ignored.
+  bool stored = 1;
+}
+
+message SetRequest {
+  string namespace = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message SetResponse {
+  // Backing store revision of the write.
+  int64 revision = 1;
+}
+
+message DeleteRequest {
+  string namespace = 1;
+  string key = 2;
+}
+
+message DeleteResponse {
+  int64 revision = 1;
+  bool existed = 2;
+}
+
+message InvalidateRequest {
+  string namespace = 1;
+  // Keys to invalidate. Empty with all=true invalidates the whole namespace.
+  repeated string keys = 2;
+  bool all = 3;
+}
+
+message InvalidateResponse {}
+
+message SubscribeRequest {
+  string namespace = 1;
+  // Epoch and position of the last event the subscriber processed. Empty
+  // for a fresh subscription.
+  string epoch = 2;
+  string position = 3;
+}
+
+message Invalidation {
+  string key = 1;
+  // Revision of the change. Copies at or above it are still valid.
+  int64 revision = 2;
+}
+
+message SubscribeResponse {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // Invalidations follow, in order.
+    KIND_INVALIDATIONS = 1;
+    // Drop every near-cache entry of the namespace. Sent when resuming is
+    // impossible or the namespace was purged.
+    KIND_RESET = 2;
+    // Nothing changed; proves the stream is alive.
+    KIND_HEARTBEAT = 3;
+  }
+  Kind kind = 1;
+  string epoch = 2;
+  // Position after this message. Pass it back to resume.
+  string position = 3;
+  repeated Invalidation invalidations = 4;
+}

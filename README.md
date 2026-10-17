@@ -1,205 +1,208 @@
 # proplyd
 
-Centralized cache service for the [c12s](https://github.com/c12s) platform.
+Central cache service for the [c12s](https://github.com/c12s) platform.
 
-Services register a **namespace** and pick how it behaves: read strategy, write
-strategy, eviction policy, capacity and TTL. The cache sits in front of etcd,
-talks to it directly, and follows etcd's change stream to stay consistent.
-Clients talk to the cache over gRPC. When the cache is slow, unreachable or
-dead, they keep working against etcd directly, behind a circuit breaker.
+proplyd sits between c12s services and their backing store (etcd). It keeps
+cached entries in **Redis**, loads and writes through the store, follows the
+store's change stream, and streams invalidations to the **near-caches** that
+every client keeps in process ([proplyd-go](https://github.com/c12s/proplyd-go)).
+When the cache is slow or down, clients keep working against the store
+directly, behind a circuit breaker.
 
 ```
- service A ─┐                                   ┌──────────────┐
- service B ─┼── gRPC ──▶  proplyd (cache) ──────▶│              │
- service C ─┘   │          ▲  per-namespace      │     etcd     │
-                │          └── watch (changes) ──│              │
-                └──────── fallback (cache down) ─▶│              │
-                                                 └──────────────┘
+ edge service                                         central
+┌───────────────────────────────┐   gRPC   ┌────────────────┐  RESP  ┌───────┐
+│ app ─▶ proplyd-go             │ ───────▶ │    proplyd     │ ─────▶ │ Redis │
+│        near-cache ([]byte)    │ ◀─────── │   (stateless)  │        └───────┘
+│        breaker, fallback      │ invalid- └───────┬────────┘
+└──────────────┬────────────────┘ ations           │ load, write, watch
+               │                                   ▼
+               └──── fallback (cache down) ──▶   etcd
 ```
+
+Everything that must survive a restart lives in Redis: namespaces, entries,
+watch progress and the invalidation log. proplyd processes are disposable;
+several can run against one Redis.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `api/proplyd/v1/cache.proto` | gRPC API (generated code in `api/proplydpb`) |
-| `cache/` | The cache engine: namespaces, strategies, consistency |
-| `store/` | Storage abstraction (`store.Store`) + samber/hot implementation |
-| `backend/` | Backing-store abstraction (`backend.Backend`) + `etcd` and in-memory `memory` implementations |
-| `server/` | gRPC server over the engine (error mapping, health, graceful shutdown) |
-| `client/` | Go client: circuit breaker, timeouts, fallbacks, re-registration |
-| `protocol/` | Types shared by client and server (namespace config, error reasons) |
+| `pkg/api/proto/proplyd.proto` | gRPC API; generated code in `pkg/api` |
+| `pkg/protocol` | Namespace spec (validation, defaults, proto conversion) and error reasons, shared with clients |
+| `pkg/backend` | `Backend`/`Watcher` interfaces; `etcd`, in-memory `memory`, fault-injecting `faulty`, and the `backendtest` conformance suite |
+| `pkg/server` | gRPC server: error mapping, health, graceful/crash shutdown. Public so it can be embedded in tests |
+| `internal/engine` | The cache engine: Lua scripts, strategies, watcher, invalidation streams |
 | `cmd/proplyd` | Server binary |
-| `tests/` | Stress, chaos and end-to-end etcd tests |
-| `internal/testutil` | Fault-injecting proxy, restartable cache node, embedded etcd |
+| `proplydtest` | Test kit: real `redis-server` you can kill/restart, TCP fault proxy, restartable nodes; `etcdtest` for embedded etcd |
 
-The client imports only `protocol`, `backend` and the generated API, never
-the engine, so it stays small on constrained devices.
+## Namespaces and strategies
 
-## Strategies
+A client registers a **namespace** with a spec; every client of the
+namespace must use the same spec (a different one is rejected with
+`NAMESPACE_CONFLICT`). Keys are relative to the namespace's store prefix.
 
-Strategies are chosen per namespace at registration. Every client of a
-namespace must use the same configuration; a conflicting registration is
-rejected.
+**Read strategy**
 
-**Read**
-
-| Strategy | Miss handling |
+| Strategy | On a miss |
 |---|---|
-| `ReadThrough` (default) | The cache loads from etcd. Concurrent misses for a key share one load. |
-| `CacheAside` | The cache reports a miss. The client loads from etcd and calls `Fill`. |
-| `RefreshAhead` | Read-through. Entries older than `RefreshAfter` (default 75% of TTL) are reloaded in the background while the cached value is still served. |
+| `ReadThrough` (default) | proplyd loads from the store. Concurrent misses share one load. |
+| `CacheAside` | proplyd reports a miss; the client loads from the store and calls `Fill`. |
+| `RefreshAhead` | Read-through, and entries older than `RefreshAfter` (default 75% of TTL) are reloaded in the background while the cached value is served. |
 
-**Write**
+**Write strategy**
 
-| Strategy | Normal operation | Cache unreachable | Guarantee |
-|---|---|---|---|
-| `WriteThrough` (default) | The cache writes etcd, then updates itself | **Write rejected** (`ErrCacheUnavailable`) | The cache never diverges from etcd, but writes can be refused |
-| `WriteAround` | The cache writes etcd and invalidates its entry | **Client writes etcd directly** | Every write is recorded; the cache catches up via its etcd watch |
-| `WriteBehind` | Acknowledged in memory, flushed in batched etcd transactions | Write rejected | Lowest latency. **Unflushed writes are lost if the cache process crashes** |
+| Strategy | Cache reachable | Cache unreachable |
+|---|---|---|
+| `WriteThrough` (default) | proplyd writes the store, then caches the value | **Write rejected** (`ErrCacheUnavailable`) |
+| `WriteAround` | proplyd writes the store and invalidates the entry | **Client writes the store directly**; the cache picks it up through its watch |
 
-With write-behind, writes to the same key are coalesced before a flush. A
-graceful shutdown (SIGTERM) flushes everything pending. `MaxPending` bounds
-memory: when the queue is full, writes fail with `ErrBackpressure`.
+Write-behind is not implemented yet (the enum value is reserved).
 
-**Eviction:** `sieve` (default), `lru`, `lfu`, `2q`, `fifo`, `tinylfu`, `wtinylfu`. See the known issues below.
+**Sync mode:** `SyncWatch` (default) follows the store's change stream for
+the namespace prefix, so writes that bypass the cache (client fallbacks,
+other services) update or invalidate cached entries within milliseconds.
+`SyncNone` relies on writes going through the cache; anything else stays
+invisible until the entry expires.
 
-**Sync mode:** `WATCH` makes the cache follow etcd's change stream for the
-namespace prefix. `AUTO` (the default) turns it on for write-around only.
-Turn it on explicitly if other writers modify the keys.
+**Eviction:** each client picks the near-cache policy for its device (SIEVE,
+LRU, LFU, 2Q, FIFO, TinyLFU, W-TinyLFU) in proplyd-go. Centrally, entries
+expire after the namespace TTL (with 10% jitter), and Redis's
+`maxmemory-policy` evicts under memory pressure.
 
 ## Consistency model
 
-Every cached entry carries the etcd revision it reflects. All state changes
-for a key (loads, fills, writes, watch events, flushes) are serialized by a
-lock stripe and applied only if they are newer than:
+Every cached entry carries the store revision it reflects. All state
+changes (loads, fills, writes, watch events) go through one Lua script that
+applies a change only if it is newer than what Redis holds:
 
-1. the cached entry, and
-2. the latest change to that key the namespace knows of (a bounded *change
-   log*).
+- **Values and "not found" entries** are ordered by revision; an older
+  load never overwrites a newer value.
+- **Every change is announced.** Writes and watch events publish an
+  invalidation. A load that already sees a write which bypassed the cache
+  (before the watcher does) marks its entry "quiet"; the watcher's later
+  event then still publishes, so near-caches never miss a change.
+- **Fences.** A change to a key that is not cached leaves a short-lived
+  fence (default 30s, longer than the load timeout). A load that read the
+  store *before* the change is refused. This closes the classic cache-aside
+  race where a slow reader installs a value read before a concurrent write.
+- **Epochs.** Every entry carries the namespace epoch. Changing the epoch
+  (an O(1) purge) kills every entry at once.
+- **Floor.** When watch history is lost (etcd compacted it), the namespace
+  is purged and loads that read before the current revision are refused.
+- **Catch-up gate.** When proplyd (re)activates a namespace, it serves it
+  only once the watch progress recorded in Redis reaches the store's current
+  revision. So a restarted proplyd never serves entries that missed changes
+  made while it was down, such as client fallback writes. Until then
+  requests fail with `CACHE_UNAVAILABLE` and clients fall back.
+- **Redis restarts.** proplyd notices a changed Redis `run_id` (restart or
+  failover) and reloads every namespace. A Redis that lost its data loses
+  the namespaces, and clients re-register transparently. A Redis that came
+  back from an older snapshot gets its watch replayed from the snapshot's
+  progress.
 
-This closes the classic cache-aside race, where a slow reader installs a
-value read before a concurrent write. A watch replay or a late load can never
-overwrite newer data either. If the watch cannot resume because etcd
-compacted the history, the namespace is purged and resynchronized.
+### Near-cache invalidation
 
-### Failure behaviour
+Every change is appended to a per-namespace Redis Stream; each proplyd tails
+it and fans it out over gRPC (`Subscribe`). Invalidations carry revisions,
+so a near-cache keeps copies that already reflect a change. A client that
+reconnects passes its epoch and position and resumes without losing events.
+If that is impossible (log trimmed, epoch changed, Redis rolled back), the
+first message is a reset. Idle streams carry heartbeats, so a silently
+stalled link is detected.
 
-| Situation | Reads | Write-through | Write-around | Write-behind |
-|---|---|---|---|---|
-| Cache crashed / restarting | etcd directly | rejected | etcd directly | rejected; unflushed data lost |
-| Client ↔ cache partition | etcd directly | rejected | etcd directly; the cache sees it via watch | rejected |
-| Cache slower than timeout | etcd directly | rejected | etcd directly | rejected |
-| Cache ↔ etcd broken, client ↔ etcd fine | etcd directly | `ErrStoreUnavailable` | etcd directly | queued, retried with backoff |
-| etcd down | `ErrStoreUnavailable` | `ErrStoreUnavailable` | `ErrStoreUnavailable` | queued, retried with backoff |
+### Several proplyd replicas
 
-Only failures of the cache itself (unreachable, timeouts, internal errors)
-count against the circuit breaker. etcd failures reported by the cache,
-backpressure and caller cancellations do not. After a cache restart the
-client registers its namespace again transparently.
+All state is in Redis, so replicas need no coordination except for the
+watcher: a lease (`<prefix>{ns}:w`, default 5s) makes one replica follow a
+namespace's change stream at a time. When it dies, another replica takes
+over after the lease expires and resumes from the recorded progress. Run
+replicas with stable `-instance-id`s (for example the pod name of a
+StatefulSet): a restarted replica with the same ID takes its lease back at
+once.
 
-## Client usage
+## Failure behaviour
 
-```go
-cli, _ := clientv3.New(clientv3.Config{Endpoints: []string{"etcd:2379"}})
+| Situation | Reads | Write-through | Write-around |
+|---|---|---|---|
+| proplyd down, restarting or partitioned from the client | store directly | rejected | store directly; the cache catches up via watch |
+| proplyd slower than the client timeout | store directly | rejected | store directly |
+| Redis down | store directly (proplyd reports `NOT_SERVING`) | rejected | store directly |
+| proplyd ↔ store broken, client ↔ store fine | cached data served; misses: store directly | `ErrBackendUnavailable` | store directly |
+| store down | cached data served; misses fail | fail | fail |
 
-c, err := client.New(ctx, client.Config{
-	Target:    "dns:///proplyd:7070",
-	Namespace: "magnetar",
-	Spec: protocol.Namespace{
-		Read:      protocol.ReadThrough,
-		Write:     protocol.WriteAround,
-		Eviction:  protocol.EvictSIEVE,
-		Capacity:  50_000,
-		TTL:       10 * time.Minute,
-		KeyPrefix: "/magnetar/",
-	},
-	// Direct etcd access for fallback (and cache-aside loads).
-	Store: etcd.New(cli, "/magnetar/"),
-})
+Only failures of the cache itself (unreachable, timeouts, Redis down) count
+against the client's circuit breaker. Store errors reported by the cache,
+invalid requests and the caller's own cancellations do not.
 
-err = c.Set(ctx, "nodes/n1", payload, client.WithTTL(time.Minute))
-val, found, err := c.Get(ctx, "nodes/n1")
-item, err := c.Lookup(ctx, "nodes/n1") // + Source (cache/store) and ModRevision
+## Running
+
 ```
-
-`client.Config` also controls the timeouts (`RequestTimeout` for reads,
-default 500ms; `WriteTimeout`, default 2s) and the circuit breaker
-(consecutive failures, failure ratio, open duration, half-open probes).
-`c.State()` and `c.Metrics()` expose the breaker state and fallback counters.
-
-## Running the server
-
-```
-proplyd -listen :7070 -etcd-endpoints etcd-0:2379,etcd-1:2379 \
-        -allowed-prefixes /magnetar/,/kuiper/ -shutdown-timeout 30s
+proplyd -listen :7070 -redis-addrs redis:6379 -etcd-endpoints etcd-0:2379,etcd-1:2379 \
+        -allowed-prefixes /magnetar/,/kuiper/ -instance-id $POD_NAME
 ```
 
 | Flag | Env | Default |
 |---|---|---|
 | `-listen` | `PROPLYD_LISTEN` | `:7070` |
+| `-redis-addrs` | `PROPLYD_REDIS_ADDRS` | `localhost:6379` |
+| `-redis-master` (Sentinel) | `PROPLYD_REDIS_MASTER` | |
+| `-redis-username`, `-redis-password` | `PROPLYD_REDIS_USERNAME`, `PROPLYD_REDIS_PASSWORD` | |
+| `-redis-key-prefix` | `PROPLYD_REDIS_KEY_PREFIX` | `pd:` |
 | `-etcd-endpoints` | `PROPLYD_ETCD_ENDPOINTS` | `localhost:2379` |
 | `-allowed-prefixes` | `PROPLYD_ALLOWED_PREFIXES` | any |
-| `-tls-cert` / `-tls-key` | `PROPLYD_TLS_CERT` / `PROPLYD_TLS_KEY` | plaintext |
+| `-instance-id` | `PROPLYD_INSTANCE_ID` | hostname |
+| `-tls-cert`, `-tls-key` | `PROPLYD_TLS_CERT`, `PROPLYD_TLS_KEY` | plaintext |
 | `-log-level` | `PROPLYD_LOG_LEVEL` | `info` |
-| `-load-timeout`, `-shutdown-timeout`, `-etcd-dial-timeout` | | 5s, 30s, 5s |
+| `-max-value-size`, `-load-timeout`, `-fence-ttl`, `-lease-ttl`, `-invalidation-log-size`, `-shutdown-timeout` | | 1 MiB, 5s, 30s, 5s, 10000, 30s |
 
-The server also exposes the standard `grpc.health.v1` service.
+The server exposes `grpc.health.v1` and reports `NOT_SERVING` while Redis is
+unreachable, so health-checking clients skip it. SIGTERM shuts down
+gracefully: subscriptions are ended (clients resume elsewhere), in-flight
+calls finish, and watcher leases are handed back.
+
+**Redis requirements.** Redis ≥ 7.0 or Valkey; the scripts use the bundled
+`struct` Lua library. Use `maxmemory-policy volatile-lru` (or `volatile-lfu`
+or `volatile-ttl`). Entries always have a TTL and metadata never does, so
+these policies only evict entries; proplyd warns at startup otherwise.
+`-redis-addrs` with several addresses selects Redis Cluster, and adding
+`-redis-master` selects Sentinel. Every key of a namespace shares the hash
+tag `{namespace}`, so the multi-key scripts work on Cluster.
 
 ## Tests
 
 ```
-make test         # everything, with -race (embedded etcd included)
-make test-short   # fast subset
-make stress       # 30s, 16 clients per namespace
-make chaos        # 60s of continuous fault injection
+make test        # everything, with -race (needs redis-server on PATH)
+make test-short  # skips embedded etcd
 ```
 
-- **Engine unit tests** (`cache/`): every strategy, stale-fill races,
-  load deduplication, refresh-ahead, TTL, each eviction policy, watch
-  updates, resume and compaction resync, write-behind coalescing, outage
-  retry, eviction of pending entries, backpressure, flush on close, and loss
-  on crash.
-- **Client tests** (`client/`), over real gRPC and TCP:
-  - every read × write combination;
-  - the cache never started, crashed and restarted (breaker open → half-open → closed, transparent re-registration);
-  - slow cache, client partition (write-around keeps the cache in sync, write-through rejects);
-  - etcd unreachable from the cache only, and etcd down;
-  - write-behind lost on crash vs flushed on graceful shutdown;
-  - backpressure, conflicts, caller cancellation.
-- **Stress** (`tests/TestStress`): about 48 clients over six namespaces covering
-  all strategy families. It checks read-your-writes on every read of a
-  client's own keys, the exact final state in etcd, and cache/etcd
-  convergence for every key.
-- **Chaos** (`tests/TestChaos`): the same workload while crashing the cache,
-  partitioning and resetting connections, slowing or killing the store,
-  breaking the cache→store link, and dropping or compacting watch streams.
-  After the chaos it verifies that no unexpected errors surfaced, that
-  acknowledged write-through and write-around writes were never lost, and
-  that every key converges.
-- **End-to-end with etcd** (`tests/TestEndToEndWithEtcd`, `backend/etcd`),
-  using embedded etcd.
+- **Engine** (`internal/engine`, real Redis): every strategy, shared loads,
+  stale fills refused (fences), watch updates in place and fences,
+  catch-up after a restart, compaction → purge, Redis restart without
+  persistence, Redis rolled back to an old snapshot, validation, store down,
+  Redis down (fail fast, no store write), watcher lease handover,
+  invalidation streams (resume, reset on purge/stale epoch/trimmed log,
+  heartbeats, end when Redis dies).
+- **Backends**: one conformance suite (`backendtest`) run against etcd
+  (embedded), the in-memory store and the fault wrapper.
+- **Server**: gRPC error mapping, health following Redis, end to end on
+  etcd (a direct etcd write reaches subscribers), graceful shutdown with
+  open streams.
 
-## Extending
+The multi-client stress, bad-network and chaos tests live in proplyd-go
+(they need the client).
 
-- **Distributed cache:** implement `store.Store` (for example on
-  Olric/Redis) and pass it as `cache.Options.Stores`. Strategy and
-  consistency logic stay in the engine. Note that write-behind state and the
-  change log are per process today, so a multi-node cache also needs to
-  distribute or partition those, for example by consistent-hashing
-  namespaces to nodes.
-- **Other databases:** implement `backend.Backend` (and `backend.Watcher`
-  for change streams) and pass it as `cache.Options.Backends`.
+## Not done yet
 
-## Known issues / notes
-
-- **samber/hot v0.13.1:**
-  - `arc` does not enforce its capacity (it grew to 26k entries at capacity
-    1k in our benchmark), so it is rejected at registration.
-  - `tinylfu`/`wtinylfu` filter admissions aggressively and hold far fewer
-    entries than their capacity.
-  - Its built-in sharding creates unlocked shards, so `store.Hot` does its
-    own sharding.
-- Watch-applied updates use the namespace TTL; per-key TTL overrides apply
-  to writes and fills only.
-- No authentication yet: use TLS plus `-allowed-prefixes`, and add mTLS or
-  per-namespace auth before exposing the cache beyond the cluster.
+- **Write-behind.** A durable design would keep pending writes in Redis
+  (never evicted) with a flush queue.
+- **Per-client invalidation filtering.** Today every subscriber gets every
+  invalidation of its namespace. On very thin links (tens of KB/s) under a
+  heavy write load, that stream alone can saturate the link. Tracking which
+  keys each client holds (like Redis client-side caching) would fix it.
+- **Batched watch apply.** The watcher runs one script per event
+  (pipelined). One script per batch would raise throughput if the store's
+  write rate ever outruns it; when the watcher falls behind etcd's history,
+  the namespace is purged, which is correct but costly.
+- **Authentication.** Use TLS plus `-allowed-prefixes` for now; add mTLS or
+  per-namespace auth before exposing proplyd beyond the cluster.

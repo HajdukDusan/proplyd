@@ -1,0 +1,12 @@
+version: v2
+modules:
+  - path: pkg/api/proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # c12s keeps protos in pkg/api/proto, not in a proplyd/v1 directory.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE
