@@ -981,3 +981,272 @@ func TestStoreResetDetectedAtRuntime(t *testing.T) {
 		return errors.New("near-caches were not told to reset")
 	})
 }
+
+func wbEnv(t *testing.T, p proplydtest.Persistence) *env {
+	t.Helper()
+	v := newEnv(t, p)
+	v.opts.FlushInterval = 200 * time.Millisecond
+	return v
+}
+
+func storeValue(t *testing.T, v *env, key string) (string, bool) {
+	t.Helper()
+	it, err := v.store.Get(context.Background(), "/test/"+key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(it.Value), it.Found
+}
+
+func storeHas(t *testing.T, v *env, key, want string) {
+	t.Helper()
+	eventually(t, func() error {
+		got, found := storeValue(t, v, key)
+		if (want == "") == found || got != want {
+			return fmt.Errorf("store has %q (found=%v), want %q", got, found, want)
+		}
+		return nil
+	})
+}
+
+func TestWriteBehindAcknowledgesBeforeTheStore(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	v.opts.FlushInterval = time.Second
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	s := subscribe(e, "", "")
+	eventually(t, func() error {
+		if len(s.snapshot()) == 0 {
+			return errors.New("not subscribed")
+		}
+		return nil
+	})
+	ctx := context.Background()
+
+	rev, err := e.Set(ctx, ns, "k", []byte("v"))
+	if err != nil || rev != 0 {
+		t.Fatalf("set: rev=%d err=%v", rev, err)
+	}
+	if _, found := storeValue(t, v, "k"); found {
+		t.Fatal("write-behind wrote the store synchronously")
+	}
+	r := get(t, e, "k")
+	expectValue(t, r, "v")
+	if !r.Pending {
+		t.Fatal("unflushed write must read as pending")
+	}
+	s.invalidated(t, "k", 0) // near-caches drop their copy at once
+
+	storeHas(t, v, "k", "v")
+	eventually(t, func() error {
+		if r := get(t, e, "k"); r.Pending {
+			return errors.New("still pending after the flush")
+		}
+		return nil
+	})
+	it, _ := v.store.Get(ctx, "/test/k")
+	s.invalidated(t, "k", it.ModRevision)
+	if r := get(t, e, "k"); r.Revision != it.ModRevision {
+		t.Fatalf("cached revision %d, store %d", r.Revision, it.ModRevision)
+	}
+}
+
+func TestWriteBehindCoalesces(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	v.opts.FlushInterval = time.Second
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	before, _ := v.store.Revision(context.Background())
+	for i := range 20 {
+		if _, err := e.Set(context.Background(), ns, "k", []byte(fmt.Sprint("v", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storeHas(t, v, "k", "v19")
+	after, _ := v.store.Revision(context.Background())
+	if writes := after - before; writes > 2 {
+		t.Fatalf("20 writes to one key made %d store writes", writes)
+	}
+}
+
+func TestWriteBehindAcceptsWritesWhileTheStoreIsDown(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	v.put("cached", "0")
+	get(t, e, "cached")
+
+	v.be.SetDown(true)
+	for _, k := range []string{"cached", "uncached"} {
+		if _, err := e.Set(context.Background(), ns, k, []byte("new")); err != nil {
+			t.Fatalf("%s: %v", k, err)
+		}
+		expectValue(t, get(t, e, k), "new")
+	}
+	time.Sleep(500 * time.Millisecond) // flushes fail meanwhile
+	v.be.SetDown(false)
+	storeHas(t, v, "cached", "new")
+	storeHas(t, v, "uncached", "new")
+	if n := e.Stats().UnknownBases.Load(); n != 1 {
+		t.Fatalf("unknown bases = %d, want 1 (the uncached key)", n)
+	}
+}
+
+// Someone writes the store behind a pending write: the store wins.
+func TestWriteBehindConflictStoreWins(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	v.put("k", "v1")
+	get(t, e, "k")
+
+	v.be.SetDown(true) // hold the flush
+	if _, err := e.Set(context.Background(), ns, "k", []byte("mine")); err != nil {
+		t.Fatal(err)
+	}
+	v.put("k", "theirs") // another writer, straight to the store
+	v.be.SetDown(false)
+
+	eventually(t, func() error {
+		if e.Stats().FlushConflicts.Load() != 1 {
+			return errors.New("no conflict yet")
+		}
+		return nil
+	})
+	if got, _ := storeValue(t, v, "k"); got != "theirs" {
+		t.Fatalf("store has %q", got)
+	}
+	eventually(t, func() error {
+		if r := get(t, e, "k"); string(r.Value) != "theirs" || r.Pending {
+			return fmt.Errorf("cache serves %+v", r)
+		}
+		return nil
+	})
+}
+
+func TestWriteBehindSurvivesProplydCrash(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e1 := v.engine()
+	v.register(e1, protocol.Spec{Write: protocol.WriteBehind})
+	get(t, e1, "warm") // in sync with the store before it goes down
+	v.be.SetDown(true)
+	if _, err := e1.Set(context.Background(), ns, "k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	e1.Abort()
+	v.be.SetDown(false)
+
+	// No request touches the namespace: the restarted engine finds the
+	// pending write by itself.
+	v.engine()
+	storeHas(t, v, "k", "v")
+}
+
+// Redis comes back from a snapshot that still holds an old pending write.
+// Its base no longer matches the store, so it must not be replayed.
+func TestWriteBehindRolledBackPendingIsNotReplayed(t *testing.T) {
+	v := wbEnv(t, proplydtest.RDB)
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	v.put("k", "v0")
+	get(t, e, "k")
+	ctx := context.Background()
+
+	v.be.SetDown(true)
+	if _, err := e.Set(ctx, ns, "k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	v.redis.Save() // the snapshot holds v1 as pending
+	v.be.SetDown(false)
+	storeHas(t, v, "k", "v1")
+	if _, err := e.Set(ctx, ns, "k", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	storeHas(t, v, "k", "v2")
+
+	v.redis.Restart() // back to the snapshot: v1 pending again
+	eventually(t, func() error {
+		if e.Stats().FlushConflicts.Load() == 0 {
+			return errors.New("stale pending write not processed yet")
+		}
+		return nil
+	})
+	if got, _ := storeValue(t, v, "k"); got != "v2" {
+		t.Fatalf("rolled-back pending write was replayed: store has %q", got)
+	}
+}
+
+// The store write of a flush succeeds but its commit to Redis is lost.
+// The next attempt must recognise its own write, not call it a conflict
+// and drop the newer write that coalesced meanwhile.
+func TestWriteBehindLostCommitIsNotAConflict(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	v.put("k", "v0")
+	get(t, e, "k")
+	ctx := context.Background()
+	rc := v.redis.Client()
+	defer rc.Close()
+
+	v.be.SetDown(true)
+	if _, err := e.Set(ctx, ns, "k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a flush of v1 that reached the store but whose commit was
+	// lost: the store has v1 and the intent is still recorded.
+	rec, err := rc.HGet(ctx, "pd:{test}:p", "k").Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.HSet(ctx, "pd:{test}:n", "k", rec).Err(); err != nil {
+		t.Fatal(err)
+	}
+	v.put("k", "v1")
+	if _, err := e.Set(ctx, ns, "k", []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	v.be.SetDown(false)
+
+	storeHas(t, v, "k", "v2")
+	if n := e.Stats().FlushConflicts.Load(); n != 0 {
+		t.Fatalf("own lost commit counted as %d conflicts", n)
+	}
+}
+
+func TestWriteBehindBackpressure(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e := v.engine(func(o *engine.Options) { o.MaxPending = 3 })
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	get(t, e, "warm") // a namespace serves only once it is in sync with the store
+	v.be.SetDown(true)
+	ctx := context.Background()
+	for i := range 3 {
+		if _, err := e.Set(ctx, ns, fmt.Sprint("k", i), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := e.Set(ctx, ns, "k3", []byte("v")); !errors.Is(err, engine.ErrBackpressure) {
+		t.Fatalf("4th pending key: %v", err)
+	}
+	if _, err := e.Set(ctx, ns, "k0", []byte("again")); err != nil {
+		t.Fatalf("rewriting a pending key must not count: %v", err)
+	}
+	v.be.SetDown(false)
+	storeHas(t, v, "k0", "again")
+}
+
+func TestWriteBehindDelete(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	v.put("k", "v")
+	get(t, e, "k")
+	if _, _, err := e.Delete(context.Background(), ns, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if r := get(t, e, "k"); r.Found || !r.Pending {
+		t.Fatalf("pending delete: %+v", r)
+	}
+	storeHas(t, v, "k", "")
+}

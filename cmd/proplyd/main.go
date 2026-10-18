@@ -49,6 +49,8 @@ func run() error {
 		fenceTTL        = fs.Duration("fence-ttl", 30*time.Second, "fence lifetime (must exceed -load-timeout)")
 		leaseTTL        = fs.Duration("lease-ttl", 5*time.Second, "watcher lease duration")
 		logSize         = fs.Int64("invalidation-log-size", 10000, "invalidations kept per namespace for resuming subscribers")
+		flushInterval   = fs.Duration("flush-interval", 500*time.Millisecond, "write-behind: how long writes accumulate before a flush")
+		maxPending      = fs.Int("max-pending", 100000, "write-behind: keys waiting to be flushed per namespace before writes are refused")
 		shutdownTimeout = fs.Duration("shutdown-timeout", 30*time.Second, "graceful shutdown timeout")
 	)
 	_ = fs.Parse(os.Args[1:])
@@ -103,6 +105,8 @@ func run() error {
 		FenceTTL:            *fenceTTL,
 		LeaseTTL:            *leaseTTL,
 		InvalidationLogSize: *logSize,
+		FlushInterval:       *flushInterval,
+		MaxPending:          *maxPending,
 		TLS:                 creds,
 		Logger:              log,
 	})

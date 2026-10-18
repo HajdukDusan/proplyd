@@ -25,6 +25,7 @@ var (
 	_ backend.Backend    = (*Backend)(nil)
 	_ backend.Watcher    = (*Backend)(nil)
 	_ backend.Identifier = (*Backend)(nil)
+	_ backend.CondWriter = (*Backend)(nil)
 )
 
 // New returns a backend that uses cli. The caller keeps ownership of cli.
@@ -71,6 +72,31 @@ func (b *Backend) Revision(ctx context.Context) (int64, error) {
 		return 0, mapErr(ctx, err)
 	}
 	return resp.Header.Revision, nil
+}
+
+// PutIf implements backend.CondWriter with a transaction on the key's mod
+// revision.
+func (b *Backend) PutIf(ctx context.Context, key string, value []byte, expect int64) (int64, bool, error) {
+	resp, err := b.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", expect)).
+		Then(clientv3.OpPut(key, string(value))).
+		Commit()
+	if err != nil {
+		return 0, false, mapErr(ctx, err)
+	}
+	return resp.Header.Revision, resp.Succeeded, nil
+}
+
+// DeleteIf implements backend.CondWriter.
+func (b *Backend) DeleteIf(ctx context.Context, key string, expect int64) (int64, bool, error) {
+	resp, err := b.cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", expect)).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	if err != nil {
+		return 0, false, mapErr(ctx, err)
+	}
+	return resp.Header.Revision, resp.Succeeded, nil
 }
 
 // Identity returns the etcd cluster ID.

@@ -50,6 +50,7 @@ var (
 	_ backend.Backend    = (*Store)(nil)
 	_ backend.Watcher    = (*Store)(nil)
 	_ backend.Identifier = (*Store)(nil)
+	_ backend.CondWriter = (*Store)(nil)
 )
 
 // New returns an empty store at revision 1.
@@ -84,6 +85,43 @@ func (s *Store) Put(ctx context.Context, key string, value []byte) (int64, error
 	s.kv[key] = entry{value: v, modRev: s.rev}
 	s.appendLocked(backend.Event{Key: key, Value: v, Revision: s.rev})
 	return s.rev, nil
+}
+
+// PutIf implements backend.CondWriter.
+func (s *Store) PutIf(ctx context.Context, key string, value []byte, expect int64) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.kv[key].modRev != expect {
+		return s.rev, false, nil
+	}
+	s.rev++
+	v := clone(value)
+	s.kv[key] = entry{value: v, modRev: s.rev}
+	s.appendLocked(backend.Event{Key: key, Value: v, Revision: s.rev})
+	return s.rev, true, nil
+}
+
+// DeleteIf implements backend.CondWriter.
+func (s *Store) DeleteIf(ctx context.Context, key string, expect int64) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.kv[key]
+	if e.modRev != expect {
+		return s.rev, false, nil
+	}
+	if !ok {
+		return s.rev, true, nil
+	}
+	s.rev++
+	delete(s.kv, key)
+	s.appendLocked(backend.Event{Key: key, Deleted: true, Revision: s.rev})
+	return s.rev, true, nil
 }
 
 func (s *Store) Delete(ctx context.Context, key string) (int64, bool, error) {

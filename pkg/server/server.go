@@ -43,6 +43,9 @@ type Options struct {
 	InvalidationLogSize int64
 	HeartbeatInterval   time.Duration
 	RedisCheckInterval  time.Duration
+	FlushInterval       time.Duration
+	FlushBatch          int
+	MaxPending          int
 
 	// TLS, if set, secures the listener.
 	TLS    credentials.TransportCredentials
@@ -84,6 +87,9 @@ func New(opts Options) (*Server, error) {
 		InvalidationLogSize: opts.InvalidationLogSize,
 		HeartbeatInterval:   opts.HeartbeatInterval,
 		RedisCheckInterval:  opts.RedisCheckInterval,
+		FlushInterval:       opts.FlushInterval,
+		FlushBatch:          opts.FlushBatch,
+		MaxPending:          opts.MaxPending,
 		Logger:              log,
 	})
 	if err != nil {
@@ -206,7 +212,7 @@ func (s *Server) Get(ctx context.Context, req *api.GetRequest) (*api.GetResponse
 	if r.FromBackend {
 		src = api.Source_SOURCE_BACKEND
 	}
-	return &api.GetResponse{Miss: r.Miss, Found: r.Found, Value: r.Value, Revision: r.Revision, Source: src}, nil
+	return &api.GetResponse{Miss: r.Miss, Found: r.Found, Value: r.Value, Revision: r.Revision, Source: src, Pending: r.Pending}, nil
 }
 
 func (s *Server) Fill(ctx context.Context, req *api.FillRequest) (*api.FillResponse, error) {
@@ -273,6 +279,8 @@ func (s *Server) toStatus(err error) error {
 		return protocol.Status(codes.PermissionDenied, protocol.ReasonPrefixNotAllowed, msg)
 	case errors.Is(err, engine.ErrInvalidArgument):
 		return protocol.Status(codes.InvalidArgument, protocol.ReasonInvalidArgument, msg)
+	case errors.Is(err, engine.ErrBackpressure):
+		return protocol.Status(codes.ResourceExhausted, protocol.ReasonBackpressure, msg)
 	case errors.Is(err, engine.ErrCacheUnavailable), errors.Is(err, engine.ErrClosed):
 		return protocol.Status(codes.Unavailable, protocol.ReasonCacheUnavailable, msg)
 	case errors.Is(err, backend.ErrUnavailable):

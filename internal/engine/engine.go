@@ -77,7 +77,15 @@ type Options struct {
 	// RedisCheckInterval is how often Redis is probed for health and
 	// restarts. Default 500ms.
 	RedisCheckInterval time.Duration
-	Logger             *slog.Logger
+	// FlushInterval is how long write-behind writes accumulate (and
+	// coalesce) before the queue is flushed again. Default 500ms.
+	FlushInterval time.Duration
+	// FlushBatch is how many keys a flush writes at most. Default 100.
+	FlushBatch int
+	// MaxPending bounds the keys waiting to be flushed per namespace; new
+	// keys are refused beyond it (ErrBackpressure). Default 100000.
+	MaxPending int
+	Logger     *slog.Logger
 }
 
 func (o *Options) setDefaults() error {
@@ -109,6 +117,13 @@ func (o *Options) setDefaults() error {
 	def(&o.LeaseTTL, 5*time.Second)
 	def(&o.HeartbeatInterval, time.Second)
 	def(&o.RedisCheckInterval, 500*time.Millisecond)
+	def(&o.FlushInterval, 500*time.Millisecond)
+	if o.FlushBatch <= 0 {
+		o.FlushBatch = 100
+	}
+	if o.MaxPending <= 0 {
+		o.MaxPending = 100000
+	}
 	if o.InvalidationLogSize <= 0 {
 		o.InvalidationLogSize = 10000
 	}
@@ -152,6 +167,10 @@ type Stats struct {
 	// StoreResets counts namespaces rebased after the backing store was
 	// wiped or restored.
 	StoreResets atomic.Int64
+	// Write-behind: writes accepted, store writes made by flushes, flushes
+	// dropped because the store changed behind them, and writes accepted
+	// with an unknown base (store unreachable at write time).
+	PendingWrites, Flushed, FlushConflicts, UnknownBases atomic.Int64
 }
 
 // New starts an engine.
@@ -237,6 +256,11 @@ func (e *Engine) Register(ctx context.Context, name string, spec protocol.Spec) 
 	if spec.Sync == protocol.SyncWatch {
 		if _, ok := e.backend.(backend.Watcher); !ok {
 			return protocol.Spec{}, invalidf("the backend has no change stream; use SyncNone")
+		}
+	}
+	if spec.Write == protocol.WriteBehind {
+		if _, ok := e.backend.(backend.CondWriter); !ok {
+			return protocol.Spec{}, invalidf("write-behind needs a backend with conditional writes")
 		}
 	}
 	if err := e.checkUp(); err != nil {
@@ -464,13 +488,56 @@ func (e *Engine) monitorRedis() {
 	defer e.wg.Done()
 	t := time.NewTicker(e.opts.RedisCheckInterval)
 	defer t.Stop()
+	e.activatePending()
+	lastScan := time.Now()
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
 		case <-t.C:
 			e.checkRedis()
+			if time.Since(lastScan) >= pendingScanInterval {
+				e.activatePending()
+				lastScan = time.Now()
+			}
 		}
+	}
+}
+
+const pendingScanInterval = 5 * time.Second
+
+// activatePending activates every namespace that has write-behind writes
+// waiting, so they are flushed even if no request for the namespace
+// arrives (for example after a restart).
+func (e *Engine) activatePending() {
+	if !e.redisUp.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
+	defer cancel()
+	pattern := e.opts.RedisKeyPrefix + "{*}:q"
+	scan := func(ctx context.Context, c redis.Cmdable) error {
+		it := c.Scan(ctx, 0, pattern, 1000).Iterator()
+		for it.Next(ctx) {
+			key := it.Val()
+			open, close := strings.IndexByte(key, '{'), strings.LastIndexByte(key, '}')
+			if open < 0 || close <= open {
+				continue
+			}
+			if _, err := e.namespace(ctx, key[open+1:close]); err != nil && !errors.Is(err, ErrNamespaceNotFound) {
+				e.log.Debug("activating namespace with pending writes", "key", key, "err", err)
+			}
+		}
+		return it.Err()
+	}
+	var err error
+	if cc, ok := e.rdb.(*redis.ClusterClient); ok {
+		err = cc.ForEachMaster(ctx, func(ctx context.Context, c *redis.Client) error { return scan(ctx, c) })
+	} else {
+		err = scan(ctx, e.rdb)
+	}
+	if err != nil && e.ctx.Err() == nil {
+		e.log.Debug("scanning for pending writes", "err", err)
 	}
 }
 

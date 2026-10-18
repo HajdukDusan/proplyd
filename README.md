@@ -10,10 +10,10 @@ When the cache is slow or down, clients keep working against the store
 directly, behind a circuit breaker.
 
 ```
- edge service                                         central
+ edge service                                   central
 ┌───────────────────────────────┐   gRPC   ┌────────────────┐  RESP  ┌───────┐
 │ app ─▶ proplyd-go             │ ───────▶ │    proplyd     │ ─────▶ │ Redis │
-│        near-cache ([]byte)    │ ◀─────── │   (stateless)  │        └───────┘
+│        near-cache             │ ◀─────── │   (stateless)  │        └───────┘
 │        breaker, fallback      │ invalid- └───────┬────────┘
 └──────────────┬────────────────┘ ations           │ load, write, watch
                │                                   ▼
@@ -56,8 +56,44 @@ namespace must use the same spec (a different one is rejected with
 |---|---|---|
 | `WriteThrough` (default) | proplyd writes the store, then caches the value | **Write rejected** (`ErrCacheUnavailable`) |
 | `WriteAround` | proplyd writes the store and invalidates the entry | **Client writes the store directly**; the cache picks it up through its watch |
+| `WriteBehind` | proplyd acknowledges once the write is pending in Redis, and writes the store later | **Write rejected** (`ErrCacheUnavailable`) |
 
-Write-behind is not implemented yet (the enum value is reserved).
+### Write-behind
+
+- **Acknowledgement.** A write is acknowledged once it is stored as pending
+  in Redis, in a hash that is never evicted. Every edge reads it right away,
+  and near-caches drop their old copy.
+- **Flushing.** One proplyd per namespace (under a lease) flushes the
+  pending keys to the store, oldest first. It runs every `-flush-interval`
+  (500ms) in batches of up to 100 keys. Writes to the same key in between
+  coalesce into one store write.
+- **The store wins conflicts.** Each pending write remembers the store
+  revision it was based on, and the flush is a compare-and-set on it. If the
+  store changed behind the write, the write is dropped and logged. That
+  happens when another service wrote the key, or when Redis came back from
+  an old snapshot still holding stale pending writes, which therefore are
+  never replayed over newer data. A write made while the store was
+  unreachable and the key was not cached has no known base; its flush is
+  last-writer-wins.
+- **Flush intents.** Before writing the store, the flusher records what it
+  is about to write. If proplyd or Redis fails between the store write and
+  recording it, the next attempt recognises its own write instead of
+  calling it a conflict.
+- **Store outages.** Writes keep being accepted while the store is down;
+  flushes retry with backoff.
+- **Backpressure.** Writes to new keys are refused with `ErrBackpressure`
+  once `-max-pending` (100,000) keys wait. Backpressure does not count
+  against the client's circuit breaker.
+- **Restarts.** proplyd crashes and restarts are safe: pending writes live
+  in Redis, and a restarted proplyd finds namespaces with pending writes by
+  itself.
+- **Limits.**
+  - Pending writes are lost if Redis loses its data, so use AOF
+    persistence for write-behind namespaces.
+  - While an edge cannot reach the cache, its fallback reads come from the
+    store and miss writes still pending in the cache.
+  - The store needs conditional writes (`backend.CondWriter`); etcd has
+    them.
 
 **Sync mode:** `SyncWatch` (default) follows the store's change stream for
 the namespace prefix, so writes that bypass the cache (client fallbacks,
@@ -131,13 +167,13 @@ once.
 
 ## Failure behaviour
 
-| Situation | Reads | Write-through | Write-around |
-|---|---|---|---|
-| proplyd down, restarting or partitioned from the client | store directly | rejected | store directly; the cache catches up via watch |
-| proplyd slower than the client timeout | store directly | rejected | store directly |
-| Redis down | store directly (proplyd reports `NOT_SERVING`) | rejected | store directly |
-| proplyd ↔ store broken, client ↔ store fine | cached data served; misses: store directly | `ErrBackendUnavailable` | store directly |
-| store down | cached data served; misses fail | fail | fail |
+| Situation | Reads | Write-through | Write-around | Write-behind |
+|---|---|---|---|---|
+| proplyd down, restarting or partitioned from the client | store directly | rejected | store directly; the cache catches up via watch | rejected |
+| proplyd slower than the client timeout | store directly | rejected | store directly | rejected |
+| Redis down | store directly (proplyd reports `NOT_SERVING`) | rejected | store directly | rejected; pending writes wait (lost if Redis lost its data) |
+| proplyd ↔ store broken, client ↔ store fine | cached data served; misses: store directly | `ErrBackendUnavailable` | store directly | accepted, flushed later |
+| store down | cached data served; misses fail | fail | fail | accepted, flushed later |
 
 Only failures of the cache itself (unreachable, timeouts, Redis down) count
 against the client's circuit breaker. Store errors reported by the cache,
@@ -163,6 +199,7 @@ proplyd -listen :7070 -redis-addrs redis:6379 -etcd-endpoints etcd-0:2379,etcd-1
 | `-tls-cert`, `-tls-key` | `PROPLYD_TLS_CERT`, `PROPLYD_TLS_KEY` | plaintext |
 | `-log-level` | `PROPLYD_LOG_LEVEL` | `info` |
 | `-max-value-size`, `-load-timeout`, `-fence-ttl`, `-lease-ttl`, `-invalidation-log-size`, `-shutdown-timeout` | | 1 MiB, 5s, 30s, 5s, 10000, 30s |
+| `-flush-interval`, `-max-pending` (write-behind) | | 500ms, 100000 |
 
 The server exposes `grpc.health.v1` and reports `NOT_SERVING` while Redis is
 unreachable, so health-checking clients skip it. SIGTERM shuts down
@@ -190,7 +227,17 @@ make test-short  # skips embedded etcd
   persistence, Redis rolled back to an old snapshot, validation, store down,
   Redis down (fail fast, no store write), watcher lease handover,
   invalidation streams (resume, reset on purge/stale epoch/trimmed log,
-  heartbeats, end when Redis dies).
+  heartbeats, end when Redis dies), store wiped or restored, and
+  write-behind:
+  - acknowledged before the store;
+  - coalescing;
+  - writes accepted while the store is down;
+  - conflicts (the store wins);
+  - surviving a proplyd crash with no request arriving;
+  - a Redis rollback not replaying old writes;
+  - a lost commit not taken for a conflict;
+  - backpressure;
+  - deletes.
 - **Backends**: one conformance suite (`backendtest`) run against etcd
   (embedded), the in-memory store and the fault wrapper.
 - **Server**: gRPC error mapping, health following Redis, end to end on
@@ -202,8 +249,6 @@ The multi-client stress, bad-network and chaos tests live in proplyd-go
 
 ## Not done yet
 
-- **Write-behind.** A durable design would keep pending writes in Redis
-  (never evicted) with a flush queue.
 - **Per-client invalidation filtering.** Today every subscriber gets every
   invalidation of its namespace. On very thin links (tens of KB/s) under a
   heavy write load, that stream alone can saturate the link. Tracking which

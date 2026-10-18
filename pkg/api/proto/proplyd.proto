@@ -63,7 +63,10 @@ enum WriteStrategy {
   WRITE_STRATEGY_WRITE_THROUGH = 1;
   // The cache writes the backing store and invalidates the cached entry.
   WRITE_STRATEGY_WRITE_AROUND = 2;
-  reserved 3; // WRITE_BEHIND, not implemented yet.
+  // The cache acknowledges once the write is stored (pending) in Redis and
+  // writes the backing store later, in batches, coalescing writes to the
+  // same key. When the cache is unreachable, writes are rejected.
+  WRITE_STRATEGY_WRITE_BEHIND = 3;
 }
 
 enum SyncMode {
@@ -128,6 +131,10 @@ message GetResponse {
   // value, or the revision at which absence was observed.
   int64 revision = 4;
   Source source = 5;
+  // Write-behind only: the value is a write not yet flushed to the backing
+  // store. revision is then the newest store revision the cache knew for
+  // the key when it was written.
+  bool pending = 6;
 }
 
 message FillRequest {
@@ -153,7 +160,8 @@ message SetRequest {
 }
 
 message SetResponse {
-  // Backing store revision of the write.
+  // Backing store revision of the write (0 for write-behind: not written
+  // yet).
   int64 revision = 1;
 }
 

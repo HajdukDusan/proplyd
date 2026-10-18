@@ -15,6 +15,10 @@ import (
 //	<prefix>{ns}:k:<key>  string: entry (see entry.go), always with a TTL
 //	<prefix>{ns}:i        stream: invalidation log (fields k, r; or x on reset)
 //	<prefix>{ns}:w        string: watcher lease holder, with a TTL
+//	<prefix>{ns}:p        hash: write-behind writes not yet flushed (no TTL)
+//	<prefix>{ns}:q        sorted set: keys with pending writes, by first write
+//	<prefix>{ns}:n        hash: flush intents (write being flushed, per key)
+//	<prefix>{ns}:f        string: flusher lease holder, with a TTL
 //
 // Meta fields:
 //
@@ -25,6 +29,8 @@ import (
 //	bid    identity of the backing store instance (see backend.Identifier)
 type keyspace struct {
 	meta, stream, lease, entryPrefix string
+	pending, queue, flushLease       string
+	intent                           string
 }
 
 func newKeyspace(prefix, ns string) keyspace {
@@ -34,6 +40,10 @@ func newKeyspace(prefix, ns string) keyspace {
 		stream:      base + "i",
 		lease:       base + "w",
 		entryPrefix: base + "k:",
+		pending:     base + "p",
+		queue:       base + "q",
+		flushLease:  base + "f",
+		intent:      base + "n",
 	}
 }
 
@@ -46,6 +56,8 @@ const (
 	resRejected         = 0
 	resStored           = 1
 	resRefreshed        = 2
+	resBackpressure     = -3
+	resNeedBase         = -4
 )
 
 // luaHeader reads the current entry header. cur_kind is 0 when there is no
@@ -183,14 +195,108 @@ end
 return redis.error_reply('unknown mode ' .. mode)
 `)
 
-// getScript reads an entry together with the namespace epoch.
+// getScript reads an entry together with the namespace epoch and, for
+// write-behind namespaces, the pending write of the key (which takes
+// precedence over the entry).
 //
-// KEYS: meta, entry
-// Returns {-1} if the namespace is missing, else {1, epoch, entry|nil}.
+// KEYS: meta, entry, pending
+// ARGV: key, write-behind ('1' or '0')
+// Returns {-1} if the namespace is missing, else {1, epoch, entry|nil,
+// pending|nil}.
 var getScript = redis.NewScript(`
 local e = redis.call('HGET', KEYS[1], 'epoch')
 if not e then return {-1} end
-return {1, e, redis.call('GET', KEYS[2])}
+local p = false
+if ARGV[2] == '1' then p = redis.call('HGET', KEYS[3], ARGV[1]) end
+return {1, e, redis.call('GET', KEYS[2]), p}
+`)
+
+// Pending write record (write-behind), see pending.go:
+//
+//	[0:8]   seq, int64 big endian: namespace-wide write sequence
+//	[8:16]  base, int64 big endian: store mod revision the write is based on
+//	        (0: the key did not exist, -1: unknown); the flush compares it
+//	[16:24] seen, int64 big endian: newest revision the cache knew for the
+//	        key at write time; reads report it, so revisions never go back
+//	[24]    1 for a delete
+//	[25:]   value
+
+// wbWriteScript records a write-behind write.
+//
+// KEYS: meta, entry, stream, pending, queue
+// ARGV: unused, epoch, key, delete ('0'|'1'), value, base (” to derive it
+// from the cached entry), max pending keys, stream maxlen, now ms
+//
+// Writes to a key that is already pending keep its base, so coalesced
+// writes are checked against the revision the first one saw. Returns
+// {-1}, {-2, epoch}, {-3} (too many pending keys), {-4} (base unknown:
+// read the store and call again with it) or {1, seq}.
+var wbWriteScript = redis.NewScript(luaHeader + `
+local key = ARGV[3]
+local existing = redis.call('HGET', KEYS[4], key)
+local base, seen
+if existing then
+  base = struct.unpack('>i8', existing, 9)
+  seen = struct.unpack('>i8', existing, 17)
+else
+  if redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[7]) then return {-3} end
+  if cur_kind == 1 then base = cur_rev
+  elseif cur_kind == 2 then base = 0
+  elseif ARGV[6] ~= '' then base = tonumber(ARGV[6])
+  else return {-4} end
+  seen = base
+  if cur_kind ~= 0 and cur_rev > seen then seen = cur_rev end
+  redis.call('ZADD', KEYS[5], ARGV[9], key)
+end
+local seq = redis.call('HINCRBY', KEYS[1], 'wseq', 1)
+redis.call('HSET', KEYS[4], key, struct.pack('>i8i8i8B', seq, base, seen, tonumber(ARGV[4])) .. ARGV[5])
+-- Near-caches drop their copy; pending values carry no new revision, so
+-- the drop is unconditional.
+redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[8], '*', 'k', key, 'r', '0')
+return {1, seq}
+`)
+
+// wbCommitScript records the outcome of flushing a pending write.
+//
+// KEYS: meta, entry, stream, pending, queue, intent
+// ARGV: outcome ('ok'|'conflict'), epoch, key, seq, rev, payload, ttl_ms,
+// stream maxlen
+//
+// ok: the write is in the store at rev. It is retired if no newer write
+// arrived meanwhile; otherwise the newer write is now based on rev. The
+// cached entry becomes the flushed state.
+// conflict: the store changed behind the write; the store wins. The
+// pending write (and any newer one to the key) is dropped, along with the
+// cached entry.
+var wbCommitScript = redis.NewScript(luaHeader + `
+local key = ARGV[3]
+local rev = tonumber(ARGV[5])
+local function publish(r)
+  redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[8], '*', 'k', key, 'r', r)
+end
+local rec = redis.call('HGET', KEYS[4], key)
+redis.call('HDEL', KEYS[6], key)
+if ARGV[1] == 'conflict' then
+  redis.call('HDEL', KEYS[4], key)
+  redis.call('ZREM', KEYS[5], key)
+  redis.call('DEL', KEYS[2])
+  publish('0')
+  return {1}
+end
+if rec then
+  local seq = struct.unpack('>i8', rec)
+  if seq == tonumber(ARGV[4]) then
+    redis.call('HDEL', KEYS[4], key)
+    redis.call('ZREM', KEYS[5], key)
+  else
+    redis.call('HSET', KEYS[4], key, string.sub(rec, 1, 8) .. struct.pack('>i8i8', rev, rev) .. string.sub(rec, 25))
+  end
+end
+if cur_kind == 0 or cur_kind == 3 or rev > cur_rev then
+  redis.call('SET', KEYS[2], ARGV[6], 'PX', ARGV[7])
+end
+publish(ARGV[5])
+return {1}
 `)
 
 // registerScript creates a namespace unless it exists.
@@ -290,7 +396,7 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 `)
 
-var allScripts = []*redis.Script{installScript, getScript, registerScript, metaScript, purgeScript, adoptScript, wrevScript, leaseScript, releaseScript}
+var allScripts = []*redis.Script{installScript, getScript, registerScript, metaScript, purgeScript, adoptScript, wbWriteScript, wbCommitScript, wrevScript, leaseScript, releaseScript}
 
 // loadScripts loads every script into the Redis script cache.
 func loadScripts(ctx context.Context, rdb redis.UniversalClient) error {

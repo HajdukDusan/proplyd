@@ -47,9 +47,14 @@ func (ns *namespace) runWatcher() {
 }
 
 func (ns *namespace) acquireLease(ctx context.Context) (bool, error) {
+	return ns.acquire(ctx, ns.ks.lease)
+}
+
+// acquire takes or renews the lease at key for this engine.
+func (ns *namespace) acquire(ctx context.Context, key string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	n, err := leaseScript.Run(ctx, ns.e.rdb, []string{ns.ks.lease}, ns.e.opts.InstanceID, ns.e.opts.LeaseTTL.Milliseconds()).Int()
+	n, err := leaseScript.Run(ctx, ns.e.rdb, []string{key}, ns.e.opts.InstanceID, ns.e.opts.LeaseTTL.Milliseconds()).Int()
 	return n == 1, err
 }
 

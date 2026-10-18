@@ -14,7 +14,10 @@ this file holds decisions and invariants the code does not explain.
   stateless and every Redis key is hash-tagged `{namespace}`.
 - **proplyd talks to the store (etcd) itself**: no client callbacks. Clients
   have direct store access only for fallback and cache-aside loads.
-- **Write-behind is left out for now** (proto enum value 3 is reserved).
+- **Write-behind** (added 2026-10-18): pending writes live in Redis and
+  proplyd flushes them to the store. The user chose **reject when the cache
+  is unreachable** and **the store wins conflicts** (compare-and-set on the
+  base revision, so a Redis rollback never replays old writes).
 - Cache unreachable: **write-through returns an error; write-around writes
   the store directly**. The user asked how the cache then gets refreshed;
   the answer is the etcd watch (SyncWatch, the default for every namespace).
@@ -92,5 +95,19 @@ this file holds decisions and invariants the code does not explain.
   reset marker). `awaitSync` won't mark ready while a reset is pending, and
   `applyBatch` returns `errStoreRegressed` if a watch reports a revision
   below wrev. Tests: `TestStoreReset*` (swappable backend).
+- **Write-behind** (`pending.go`):
+  - `{ns}:p` holds the pending records (seq | base | seen | del | value; see
+    scripts.go). `{ns}:q` is the queue, `{ns}:n` holds flush intents and
+    `{ns}:f` is the flusher lease.
+  - Reads: getScript returns the pending record before the entry. A pending
+    read reports `seen` (never `base`, which is 0 for keys that were absent),
+    which keeps revisions monotonic.
+  - A write publishes r=0. A flush publishes the store revision.
+  - Commit: retire the write if seq is unchanged, else rebase the newer
+    write onto the flushed revision. A conflict drops it.
+  - `finishIntent` treats "the store holds the intent's value" as our own
+    flush.
+  - `activatePending` scans `{*}:q` at startup and every 5s.
+  - Purges and rebases never touch pending writes.
 - Redis restart detection: `run_id` change → `reloadAll` (stop and forget
   every namespace; the next request re-activates and the watch replays).

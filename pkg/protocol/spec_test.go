@@ -35,13 +35,13 @@ func TestNormalizeDefaults(t *testing.T) {
 
 func TestNormalizeRejects(t *testing.T) {
 	for name, s := range map[string]Spec{
-		"no prefix":           {},
-		"ttl too short":       {KeyPrefix: "/p/", TTL: time.Millisecond},
-		"refresh after ttl":   {KeyPrefix: "/p/", Read: RefreshAhead, TTL: time.Second, RefreshAfter: time.Second},
-		"negative ttl > ttl":  {KeyPrefix: "/p/", TTL: time.Second, NegativeTTL: time.Minute},
-		"unknown read":        {KeyPrefix: "/p/", Read: 9},
-		"unknown write":       {KeyPrefix: "/p/", Write: 9},
-		"write-behind (todo)": {KeyPrefix: "/p/", Write: 3},
+		"no prefix":          {},
+		"ttl too short":      {KeyPrefix: "/p/", TTL: time.Millisecond},
+		"refresh after ttl":  {KeyPrefix: "/p/", Read: RefreshAhead, TTL: time.Second, RefreshAfter: time.Second},
+		"negative ttl > ttl": {KeyPrefix: "/p/", TTL: time.Second, NegativeTTL: time.Minute},
+		"unknown read":       {KeyPrefix: "/p/", Read: 9},
+		"unknown write":      {KeyPrefix: "/p/", Write: 9},
+		"unknown write 4":    {KeyPrefix: "/p/", Write: 4},
 	} {
 		if _, err := s.Normalize(); err == nil {
 			t.Errorf("%s: accepted %v", name, s)

@@ -26,6 +26,8 @@ const (
 	ReasonCacheUnavailable = "CACHE_UNAVAILABLE"
 	// The cache cannot reach the backing store.
 	ReasonBackendUnavailable = "BACKEND_UNAVAILABLE"
+	// Too many write-behind writes are waiting to be flushed.
+	ReasonBackpressure = "BACKPRESSURE"
 )
 
 // Status builds a gRPC status error with an ErrorInfo detail.

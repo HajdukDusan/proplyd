@@ -86,6 +86,10 @@ const (
 	WriteStrategy_WRITE_STRATEGY_WRITE_THROUGH WriteStrategy = 1
 	// The cache writes the backing store and invalidates the cached entry.
 	WriteStrategy_WRITE_STRATEGY_WRITE_AROUND WriteStrategy = 2
+	// The cache acknowledges once the write is stored (pending) in Redis and
+	// writes the backing store later, in batches, coalescing writes to the
+	// same key. When the cache is unreachable, writes are rejected.
+	WriteStrategy_WRITE_STRATEGY_WRITE_BEHIND WriteStrategy = 3
 )
 
 // Enum value maps for WriteStrategy.
@@ -94,11 +98,13 @@ var (
 		0: "WRITE_STRATEGY_UNSPECIFIED",
 		1: "WRITE_STRATEGY_WRITE_THROUGH",
 		2: "WRITE_STRATEGY_WRITE_AROUND",
+		3: "WRITE_STRATEGY_WRITE_BEHIND",
 	}
 	WriteStrategy_value = map[string]int32{
 		"WRITE_STRATEGY_UNSPECIFIED":   0,
 		"WRITE_STRATEGY_WRITE_THROUGH": 1,
 		"WRITE_STRATEGY_WRITE_AROUND":  2,
+		"WRITE_STRATEGY_WRITE_BEHIND":  3,
 	}
 )
 
@@ -555,8 +561,12 @@ type GetResponse struct {
 	Value []byte `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
 	// Revision of the returned state: the backing store mod revision of a
 	// value, or the revision at which absence was observed.
-	Revision      int64  `protobuf:"varint,4,opt,name=revision,proto3" json:"revision,omitempty"`
-	Source        Source `protobuf:"varint,5,opt,name=source,proto3,enum=proplyd.v1.Source" json:"source,omitempty"`
+	Revision int64  `protobuf:"varint,4,opt,name=revision,proto3" json:"revision,omitempty"`
+	Source   Source `protobuf:"varint,5,opt,name=source,proto3,enum=proplyd.v1.Source" json:"source,omitempty"`
+	// Write-behind only: the value is a write not yet flushed to the backing
+	// store. revision is then the newest store revision the cache knew for
+	// the key when it was written.
+	Pending       bool `protobuf:"varint,6,opt,name=pending,proto3" json:"pending,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -624,6 +634,13 @@ func (x *GetResponse) GetSource() Source {
 		return x.Source
 	}
 	return Source_SOURCE_UNSPECIFIED
+}
+
+func (x *GetResponse) GetPending() bool {
+	if x != nil {
+		return x.Pending
+	}
+	return false
 }
 
 type FillRequest struct {
@@ -819,7 +836,8 @@ func (x *SetRequest) GetValue() []byte {
 
 type SetResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Backing store revision of the write.
+	// Backing store revision of the write (0 for write-behind: not written
+	// yet).
 	Revision      int64 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1271,13 +1289,14 @@ const file_proplyd_proto_rawDesc = "" +
 	"GetRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12!\n" +
-	"\fmin_revision\x18\x03 \x01(\x03R\vminRevision\"\x95\x01\n" +
+	"\fmin_revision\x18\x03 \x01(\x03R\vminRevision\"\xaf\x01\n" +
 	"\vGetResponse\x12\x12\n" +
 	"\x04miss\x18\x01 \x01(\bR\x04miss\x12\x14\n" +
 	"\x05found\x18\x02 \x01(\bR\x05found\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x1a\n" +
 	"\brevision\x18\x04 \x01(\x03R\brevision\x12*\n" +
-	"\x06source\x18\x05 \x01(\x0e2\x12.proplyd.v1.SourceR\x06source\"\xb1\x01\n" +
+	"\x06source\x18\x05 \x01(\x0e2\x12.proplyd.v1.SourceR\x06source\x12\x18\n" +
+	"\apending\x18\x06 \x01(\bR\apending\"\xb1\x01\n" +
 	"\vFillRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
@@ -1327,11 +1346,12 @@ const file_proplyd_proto_rawDesc = "" +
 	"\x19READ_STRATEGY_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aREAD_STRATEGY_READ_THROUGH\x10\x01\x12\x1d\n" +
 	"\x19READ_STRATEGY_CACHE_ASIDE\x10\x02\x12\x1f\n" +
-	"\x1bREAD_STRATEGY_REFRESH_AHEAD\x10\x03*x\n" +
+	"\x1bREAD_STRATEGY_REFRESH_AHEAD\x10\x03*\x93\x01\n" +
 	"\rWriteStrategy\x12\x1e\n" +
 	"\x1aWRITE_STRATEGY_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cWRITE_STRATEGY_WRITE_THROUGH\x10\x01\x12\x1f\n" +
-	"\x1bWRITE_STRATEGY_WRITE_AROUND\x10\x02\"\x04\b\x03\x10\x03*N\n" +
+	"\x1bWRITE_STRATEGY_WRITE_AROUND\x10\x02\x12\x1f\n" +
+	"\x1bWRITE_STRATEGY_WRITE_BEHIND\x10\x03*N\n" +
 	"\bSyncMode\x12\x19\n" +
 	"\x15SYNC_MODE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fSYNC_MODE_WATCH\x10\x01\x12\x12\n" +

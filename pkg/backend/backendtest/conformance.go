@@ -12,10 +12,11 @@ import (
 	"github.com/c12s/proplyd/pkg/backend"
 )
 
-// Watching is a backend with a change stream.
+// Watching is a backend with a change stream and conditional writes.
 type Watching interface {
 	backend.Backend
 	backend.Watcher
+	backend.CondWriter
 }
 
 // Run checks reads, writes and revisions, history replay and progress
@@ -77,5 +78,33 @@ func Run(t *testing.T, b Watching, compact func(rev int64)) {
 	var ce *backend.CompactedError
 	if !errors.As(batch.Err, &ce) {
 		t.Fatalf("watch from compacted revision: %+v", batch)
+	}
+
+	// Conditional writes compare the key's mod revision.
+	if _, ok, err := b.PutIf(ctx, "/c/x", []byte("1"), 5); err != nil || ok {
+		t.Fatalf("PutIf on a missing key expecting 5: ok=%v err=%v", ok, err)
+	}
+	r1, ok, err := b.PutIf(ctx, "/c/x", []byte("1"), 0)
+	if err != nil || !ok {
+		t.Fatalf("PutIf create: ok=%v err=%v", ok, err)
+	}
+	if _, ok, _ := b.PutIf(ctx, "/c/x", []byte("2"), 0); ok {
+		t.Fatal("PutIf expecting absence overwrote an existing key")
+	}
+	r2, ok, err := b.PutIf(ctx, "/c/x", []byte("2"), r1)
+	if err != nil || !ok || r2 <= r1 {
+		t.Fatalf("PutIf update: rev=%d ok=%v err=%v", r2, ok, err)
+	}
+	if it, _ := b.Get(ctx, "/c/x"); string(it.Value) != "2" || it.ModRevision != r2 {
+		t.Fatalf("after PutIf: %+v", it)
+	}
+	if _, ok, _ := b.DeleteIf(ctx, "/c/x", r1); ok {
+		t.Fatal("DeleteIf with a stale revision deleted")
+	}
+	if _, ok, err := b.DeleteIf(ctx, "/c/x", r2); err != nil || !ok {
+		t.Fatalf("DeleteIf: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := b.DeleteIf(ctx, "/c/x", 0); err != nil || !ok {
+		t.Fatalf("DeleteIf on a missing key expecting absence: ok=%v err=%v", ok, err)
 	}
 }

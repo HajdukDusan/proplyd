@@ -123,6 +123,22 @@ func (f *Backend) Delete(ctx context.Context, key string) (int64, bool, error) {
 	return f.inner.Delete(ctx, key)
 }
 
+// PutIf passes through to the wrapped backend's backend.CondWriter.
+func (f *Backend) PutIf(ctx context.Context, key string, value []byte, expect int64) (int64, bool, error) {
+	if err := f.before(ctx); err != nil {
+		return 0, false, err
+	}
+	return f.inner.(backend.CondWriter).PutIf(ctx, key, value, expect)
+}
+
+// DeleteIf passes through to the wrapped backend's backend.CondWriter.
+func (f *Backend) DeleteIf(ctx context.Context, key string, expect int64) (int64, bool, error) {
+	if err := f.before(ctx); err != nil {
+		return 0, false, err
+	}
+	return f.inner.(backend.CondWriter).DeleteIf(ctx, key, expect)
+}
+
 // Identity passes through to the wrapped backend, if it has one.
 func (f *Backend) Identity(ctx context.Context) (string, error) {
 	id, ok := f.inner.(backend.Identifier)

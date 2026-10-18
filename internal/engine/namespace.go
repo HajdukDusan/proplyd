@@ -60,6 +60,10 @@ func newNamespace(e *Engine, name string, ks keyspace, m meta) *namespace {
 }
 
 func (ns *namespace) start() {
+	if ns.spec.Write == protocol.WriteBehind {
+		ns.wg.Add(1)
+		go ns.runFlusher()
+	}
 	if ns.spec.Sync != protocol.SyncWatch {
 		ns.markReady()
 		return
@@ -75,10 +79,15 @@ func (ns *namespace) stop(release bool) {
 	ns.cancel()
 	ns.tail.closeAll(fmt.Errorf("%w: namespace reloading", ErrCacheUnavailable))
 	ns.wg.Wait()
-	if release && ns.spec.Sync == protocol.SyncWatch {
+	if release {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_ = releaseScript.Run(ctx, ns.e.rdb, []string{ns.ks.lease}, ns.e.opts.InstanceID).Err()
+		if ns.spec.Sync == protocol.SyncWatch {
+			_ = releaseScript.Run(ctx, ns.e.rdb, []string{ns.ks.lease}, ns.e.opts.InstanceID).Err()
+		}
+		if ns.spec.Write == protocol.WriteBehind {
+			_ = releaseScript.Run(ctx, ns.e.rdb, []string{ns.ks.flushLease}, ns.e.opts.InstanceID).Err()
+		}
 	}
 }
 
@@ -187,6 +196,9 @@ type Result struct {
 	Revision int64
 	// FromBackend: loaded for this request.
 	FromBackend bool
+	// Pending: a write-behind write not flushed yet; Revision is the newest
+	// store revision the cache knew for the key when it was written.
+	Pending bool
 }
 
 // Get reads key. minRev, if positive, is a revision the caller knows the
@@ -196,9 +208,17 @@ func (e *Engine) Get(ctx context.Context, name, key string, minRev int64) (Resul
 	if err != nil {
 		return Result{}, err
 	}
-	ent, ok, err := ns.read(ctx, key)
+	ent, pw, ok, err := ns.read(ctx, key)
 	if err != nil {
 		return Result{}, err
+	}
+	if pw != nil {
+		e.stats.Hits.Add(1)
+		r := Result{Found: !pw.del, Pending: true, Revision: max(pw.seen, pw.base, 0)}
+		if !pw.del {
+			r.Value = pw.value
+		}
+		return r, nil
 	}
 	if ok && (ent.kind == kindValue || ent.kind == kindNegative) && ent.rev >= minRev {
 		e.stats.Hits.Add(1)
@@ -244,26 +264,36 @@ func (e *Engine) ready(ctx context.Context, name, key string) (*namespace, error
 	return ns, nil
 }
 
-// read returns the live entry of key, if any.
-func (ns *namespace) read(ctx context.Context, key string) (entry, bool, error) {
-	res, err := getScript.Run(ctx, ns.e.rdb, []string{ns.ks.meta, ns.ks.entry(key)}).Slice()
+// read returns the pending write-behind write of key, if any, and else
+// its live entry, if any.
+func (ns *namespace) read(ctx context.Context, key string) (entry, *pendingWrite, bool, error) {
+	wb := "0"
+	if ns.spec.Write == protocol.WriteBehind {
+		wb = "1"
+	}
+	res, err := getScript.Run(ctx, ns.e.rdb, []string{ns.ks.meta, ns.ks.entry(key), ns.ks.pending}, key, wb).Slice()
 	if err != nil {
-		return entry{}, false, redisErr("get", err)
+		return entry{}, nil, false, redisErr("get", err)
 	}
 	if res[0].(int64) == resNamespaceMissing {
 		ns.lost()
-		return entry{}, false, ErrNamespaceNotFound
+		return entry{}, nil, false, ErrNamespaceNotFound
 	}
 	epoch, _ := parseEpoch(res[1].(string))
 	ns.epoch.Store(epoch)
+	if len(res) > 3 && res[3] != nil {
+		if pw, ok := decodePending([]byte(res[3].(string))); ok {
+			return entry{}, &pw, false, nil
+		}
+	}
 	if len(res) < 3 || res[2] == nil {
-		return entry{}, false, nil
+		return entry{}, nil, false, nil
 	}
 	ent, ok := decodeEntry([]byte(res[2].(string)))
 	if !ok || ent.epoch != epoch {
-		return entry{}, false, nil
+		return entry{}, nil, false, nil
 	}
-	return ent, true, nil
+	return ent, nil, true, nil
 }
 
 // lost handles a namespace that disappeared from Redis.
@@ -433,6 +463,9 @@ func (e *Engine) Set(ctx context.Context, name, key string, value []byte) (int64
 	if len(value) > e.opts.MaxValueSize {
 		return 0, invalidf("value of %d bytes exceeds %d", len(value), e.opts.MaxValueSize)
 	}
+	if ns.spec.Write == protocol.WriteBehind {
+		return 0, ns.writeBehind(ctx, key, false, value)
+	}
 	rev, err := e.backend.Put(ctx, ns.spec.KeyPrefix+key, value)
 	if err != nil {
 		return 0, err
@@ -448,6 +481,10 @@ func (e *Engine) Delete(ctx context.Context, name, key string) (int64, bool, err
 	ns, err := e.ready(ctx, name, key)
 	if err != nil {
 		return 0, false, err
+	}
+	if ns.spec.Write == protocol.WriteBehind {
+		// Whether the key existed is not known until the flush.
+		return 0, false, ns.writeBehind(ctx, key, true, nil)
 	}
 	rev, existed, err := e.backend.Delete(ctx, ns.spec.KeyPrefix+key)
 	if err != nil {

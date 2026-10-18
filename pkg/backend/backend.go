@@ -78,6 +78,18 @@ type Identifier interface {
 	Identity(ctx context.Context) (string, error)
 }
 
+// CondWriter is implemented by backends with conditional writes. Write-
+// behind needs it: a flush must not overwrite a change it did not see.
+type CondWriter interface {
+	// PutIf writes key only if its mod revision is expect (0: the key must
+	// not exist). It returns the store revision after the call and whether
+	// the write happened.
+	PutIf(ctx context.Context, key string, value []byte, expect int64) (rev int64, ok bool, err error)
+	// DeleteIf deletes key only if its mod revision is expect (0: the key
+	// must not exist, which makes the delete a successful no-op).
+	DeleteIf(ctx context.Context, key string, expect int64) (rev int64, ok bool, err error)
+}
+
 // ErrUnavailable marks errors of an unreachable or failing store.
 var ErrUnavailable = errors.New("backend unavailable")
 

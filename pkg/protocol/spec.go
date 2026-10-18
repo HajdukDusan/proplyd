@@ -56,6 +56,12 @@ const (
 	// entry. When the cache is unreachable, clients write the backing store
 	// directly and the cache catches up through its watch.
 	WriteAround
+	// WriteBehind: the cache acknowledges once the write is pending in Redis
+	// and flushes it to the backing store later, coalescing writes per key.
+	// A flush is a compare-and-set on the revision the write was based on:
+	// if the store changed meanwhile, the store wins and the write is
+	// dropped. When the cache is unreachable, writes are rejected.
+	WriteBehind
 )
 
 func (s WriteStrategy) String() string {
@@ -64,6 +70,8 @@ func (s WriteStrategy) String() string {
 		return "write-through"
 	case WriteAround:
 		return "write-around"
+	case WriteBehind:
+		return "write-behind"
 	}
 	return fmt.Sprintf("WriteStrategy(%d)", int(s))
 }
@@ -164,7 +172,7 @@ func (s Spec) validate() error {
 		return fmt.Errorf("unknown read strategy %d", int(s.Read))
 	}
 	switch s.Write {
-	case WriteThrough, WriteAround:
+	case WriteThrough, WriteAround, WriteBehind:
 	default:
 		return fmt.Errorf("unknown write strategy %d", int(s.Write))
 	}
