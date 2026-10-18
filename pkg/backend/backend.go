@@ -70,6 +70,14 @@ type Watcher interface {
 	Watch(ctx context.Context, prefix string, from int64) <-chan WatchBatch
 }
 
+// Identifier is implemented by backends that can tell one store instance
+// from another (etcd: the cluster ID). proplyd records the identity and
+// treats a change as the store having been wiped or restored, since its
+// revisions then no longer compare with the ones cached.
+type Identifier interface {
+	Identity(ctx context.Context) (string, error)
+}
+
 // ErrUnavailable marks errors of an unreachable or failing store.
 var ErrUnavailable = errors.New("backend unavailable")
 

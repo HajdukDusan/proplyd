@@ -5,6 +5,8 @@ package memory
 
 import (
 	"context"
+	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ type Options struct {
 // concurrent use.
 type Store struct {
 	opts Options
+	id   string
 
 	mu      sync.Mutex
 	rev     int64
@@ -44,8 +47,9 @@ type entry struct {
 }
 
 var (
-	_ backend.Backend = (*Store)(nil)
-	_ backend.Watcher = (*Store)(nil)
+	_ backend.Backend    = (*Store)(nil)
+	_ backend.Watcher    = (*Store)(nil)
+	_ backend.Identifier = (*Store)(nil)
 )
 
 // New returns an empty store at revision 1.
@@ -53,7 +57,7 @@ func New(opts Options) *Store {
 	if opts.ProgressInterval <= 0 {
 		opts.ProgressInterval = 200 * time.Millisecond
 	}
-	return &Store{opts: opts, rev: 1, kv: map[string]entry{}, changed: make(chan struct{})}
+	return &Store{opts: opts, id: fmt.Sprintf("memory-%016x", rand.Uint64()), rev: 1, kv: map[string]entry{}, changed: make(chan struct{})}
 }
 
 func (s *Store) Get(ctx context.Context, key string) (backend.Item, error) {
@@ -96,6 +100,9 @@ func (s *Store) Delete(ctx context.Context, key string) (int64, bool, error) {
 	s.appendLocked(backend.Event{Key: key, Deleted: true, Revision: s.rev})
 	return s.rev, true, nil
 }
+
+// Identity is unique per Store: a new store is a different instance.
+func (s *Store) Identity(context.Context) (string, error) { return s.id, nil }
 
 func (s *Store) Revision(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {

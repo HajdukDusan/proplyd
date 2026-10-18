@@ -95,6 +95,14 @@ applies a change only if it is newer than what Redis holds:
   revision. So a restarted proplyd never serves entries that missed changes
   made while it was down, such as client fallback writes. Until then
   requests fail with `CACHE_UNAVAILABLE` and clients fall back.
+- **Store wiped or restored.** Cached revisions only compare with the
+  store's own timeline. proplyd records the store's identity (the etcd
+  cluster ID) and its watch progress per namespace. If the identity changes
+  or the revision goes backwards (etcd wiped, or restored from a backup), the
+  namespace is rebased: every entry is dropped, progress moves to the
+  store's current revision, and near-caches reset. Nothing is served from
+  the namespace until that is done. Namespaces with `SyncNone` don't follow
+  the store and are not checked.
 - **Redis restarts.** proplyd notices a changed Redis `run_id` (restart or
   failover) and reloads every namespace. A Redis that lost its data loses
   the namespaces, and clients re-register transparently. A Redis that came

@@ -828,3 +828,156 @@ func TestLoadReplacingOlderStatePublishes(t *testing.T) {
 	expectValue(t, r, "2")
 	s.invalidated(t, "k", rev)
 }
+
+// swappable is a backend whose store can be replaced at runtime, like an
+// etcd cluster that is wiped or restored from a backup. Swapping breaks the
+// current watches, as a real restore drops connections.
+type swappable struct {
+	mu       sync.Mutex
+	cur      *memory.Store
+	identity bool // expose the store identity
+	broken   chan struct{}
+}
+
+func newSwappable(s *memory.Store, identity bool) *swappable {
+	return &swappable{cur: s, identity: identity, broken: make(chan struct{})}
+}
+
+func (w *swappable) store() *memory.Store {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cur
+}
+
+func (w *swappable) swap(s *memory.Store) {
+	w.mu.Lock()
+	w.cur = s
+	close(w.broken)
+	w.broken = make(chan struct{})
+	w.mu.Unlock()
+}
+
+func (w *swappable) Get(ctx context.Context, k string) (backend.Item, error) {
+	return w.store().Get(ctx, k)
+}
+func (w *swappable) Put(ctx context.Context, k string, v []byte) (int64, error) {
+	return w.store().Put(ctx, k, v)
+}
+func (w *swappable) Delete(ctx context.Context, k string) (int64, bool, error) {
+	return w.store().Delete(ctx, k)
+}
+func (w *swappable) Revision(ctx context.Context) (int64, error) { return w.store().Revision(ctx) }
+
+func (w *swappable) Watch(ctx context.Context, prefix string, from int64) <-chan backend.WatchBatch {
+	w.mu.Lock()
+	s, broken := w.cur, w.broken
+	w.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	in := s.Watch(ctx, prefix, from)
+	out := make(chan backend.WatchBatch)
+	go func() {
+		defer close(out)
+		defer cancel()
+		for {
+			select {
+			case b, ok := <-in:
+				if !ok {
+					return
+				}
+				select {
+				case out <- b:
+				case <-ctx.Done():
+					return
+				}
+			case <-broken:
+				select {
+				case out <- backend.WatchBatch{Err: backend.Unavailable(errors.New("store replaced"))}:
+				case <-ctx.Done():
+				}
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// identified adds the store identity when enabled.
+type identified struct{ *swappable }
+
+func (w identified) Identity(ctx context.Context) (string, error) { return w.store().Identity(ctx) }
+
+func storeWith(t *testing.T, writes int, final string) *memory.Store {
+	t.Helper()
+	s := memory.New(memory.Options{ProgressInterval: 50 * time.Millisecond})
+	for i := range writes {
+		if _, err := s.Put(context.Background(), "/test/k", []byte(fmt.Sprint("old-", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Put(context.Background(), "/test/k", []byte(final)); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// The store is replaced while proplyd is down: on startup it must not
+// serve entries from the old store's timeline.
+func TestStoreResetDetectedAtStartup(t *testing.T) {
+	for _, withIdentity := range []bool{true, false} {
+		t.Run(fmt.Sprint("identity=", withIdentity), func(t *testing.T) {
+			v := newEnv(t, proplydtest.NoPersistence)
+			sw := newSwappable(storeWith(t, 50, "before"), withIdentity)
+			var be backend.Backend = sw
+			if withIdentity {
+				be = identified{sw}
+			}
+			e1 := v.engine(func(o *engine.Options) { o.Backend = be })
+			v.register(e1, protocol.Spec{})
+			expectValue(t, get(t, e1, "k"), "before")
+			e1.Abort()
+
+			// Restored from an old backup: far fewer revisions.
+			sw.swap(storeWith(t, 0, "restored"))
+			e2 := v.engine(func(o *engine.Options) { o.Backend = be })
+			expectValue(t, get(t, e2, "k"), "restored")
+			if n := e2.Stats().StoreResets.Load(); n != 1 {
+				t.Fatalf("store resets = %d, want 1", n)
+			}
+			// New writes on the restored store are cached normally.
+			if _, err := e2.Set(context.Background(), ns, "k", []byte("after")); err != nil {
+				t.Fatal(err)
+			}
+			expectValue(t, get(t, e2, "k"), "after")
+		})
+	}
+}
+
+// The store is replaced under a running proplyd, and by the time anyone
+// looks it has already passed the old revision: only the identity can
+// tell.
+func TestStoreResetDetectedAtRuntime(t *testing.T) {
+	v := newEnv(t, proplydtest.NoPersistence)
+	sw := newSwappable(storeWith(t, 5, "before"), true)
+	e := v.engine(func(o *engine.Options) { o.Backend = identified{sw} })
+	v.register(e, protocol.Spec{})
+	expectValue(t, get(t, e, "k"), "before")
+	s := subscribe(e, "", "")
+
+	sw.swap(storeWith(t, 50, "replaced")) // higher revisions than before
+	eventually(t, func() error {
+		if r := get(t, e, "k"); string(r.Value) != "replaced" {
+			return fmt.Errorf("still serving %q from the old store", r.Value)
+		}
+		return nil
+	})
+	eventually(t, func() error {
+		for _, ev := range s.snapshot()[1:] {
+			if ev.GetKind() == api.SubscribeResponse_KIND_RESET {
+				return nil
+			}
+		}
+		return errors.New("near-caches were not told to reset")
+	})
+}

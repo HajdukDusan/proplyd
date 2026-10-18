@@ -108,13 +108,27 @@ func (ns *namespace) awaitSync() {
 	var target int64
 	for backoff := 50 * time.Millisecond; ; backoff = min(2*backoff, 2*time.Second) {
 		ctx, cancel := context.WithTimeout(ns.ctx, ns.e.opts.LoadTimeout)
-		rev, err := ns.e.backend.Revision(ctx)
-		cancel()
+		rev, id, err := ns.e.backendState(ctx)
+		var m meta
 		if err == nil {
-			target = rev
-			break
+			m, err = readMeta(ctx, ns.e.rdb, ns.ks)
 		}
-		ns.e.log.Warn("namespace waiting for backend to sync", "namespace", ns.name, "err", err)
+		cancel()
+		if errors.Is(err, ErrNamespaceNotFound) {
+			go ns.e.forget(ns)
+			return
+		}
+		if err == nil {
+			if storeReset(m, rev, id) == "" {
+				target = rev
+				break
+			}
+			// The store was wiped or restored; wait for the watcher to
+			// rebase the namespace before serving anything from it.
+			backoff = 50 * time.Millisecond
+		} else {
+			ns.e.log.Warn("namespace waiting for backend to sync", "namespace", ns.name, "err", err)
+		}
 		if !sleepCtx(ns.ctx, backoff) {
 			return
 		}
@@ -480,7 +494,7 @@ func (e *Engine) Invalidate(ctx context.Context, name string, keys []string, all
 		return err
 	}
 	if all {
-		return ns.purge(ctx, 0)
+		return ns.purge(ctx, 0, false, "")
 	}
 	for _, k := range keys {
 		if err := protocol.ValidateKey(k); err != nil {
@@ -497,17 +511,22 @@ func (e *Engine) Invalidate(ctx context.Context, name string, keys []string, all
 
 // purge kills every entry by moving to a new epoch. With floor > 0, loads
 // that read below floor are never installed again (used when watch history
-// was lost), and the watch restarts from floor.
-func (ns *namespace) purge(ctx context.Context, floor int64) error {
-	floorArg, wrevArg := "", ""
-	if floor > 0 {
+// was lost), and the watch restarts from floor. With rebase, floor and
+// watch progress may move back (the store was wiped or restored), and the
+// store identity is updated to id.
+func (ns *namespace) purge(ctx context.Context, floor int64, rebase bool, id string) error {
+	floorArg, wrevArg, rebaseArg := "", "", ""
+	if floor > 0 || rebase {
 		floorArg, wrevArg = fmt.Sprint(floor), fmt.Sprint(floor)
+	}
+	if rebase {
+		rebaseArg = "1"
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		cur := ns.epoch.Load()
 		next := newEpoch()
 		res, err := purgeScript.Run(ctx, ns.e.rdb, []string{ns.ks.meta, ns.ks.stream},
-			epochBytes(cur), epochBytes(next), floorArg, wrevArg, ns.e.opts.InvalidationLogSize).Slice()
+			epochBytes(cur), epochBytes(next), floorArg, wrevArg, ns.e.opts.InvalidationLogSize, rebaseArg, id).Slice()
 		if err != nil {
 			return redisErr("purge", err)
 		}

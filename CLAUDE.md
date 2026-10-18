@@ -85,5 +85,12 @@ this file holds decisions and invariants the code does not explain.
 - After a backend write, the cache update runs with
   `context.WithoutCancel` (UpdateTimeout), so a caller giving up cannot
   leave the old value cached.
+- **Store reset detection**: meta field `bid` holds the store identity
+  (`backend.Identifier`; etcd cluster ID). At every watch session start,
+  `storeReset` compares identity and `rev < wrev`; on a mismatch `rebase`
+  runs `purgeScript` with rebase=1 (floor/wrev may move back, new epoch,
+  reset marker). `awaitSync` won't mark ready while a reset is pending, and
+  `applyBatch` returns `errStoreRegressed` if a watch reports a revision
+  below wrev. Tests: `TestStoreReset*` (swappable backend).
 - Redis restart detection: `run_id` change → `reloadAll` (stop and forget
   every namespace; the next request re-activates and the watch replays).

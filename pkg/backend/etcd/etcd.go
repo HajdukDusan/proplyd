@@ -4,6 +4,7 @@ package etcd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/c12s/proplyd/pkg/backend"
@@ -21,8 +22,9 @@ type Backend struct {
 }
 
 var (
-	_ backend.Backend = (*Backend)(nil)
-	_ backend.Watcher = (*Backend)(nil)
+	_ backend.Backend    = (*Backend)(nil)
+	_ backend.Watcher    = (*Backend)(nil)
+	_ backend.Identifier = (*Backend)(nil)
 )
 
 // New returns a backend that uses cli. The caller keeps ownership of cli.
@@ -69,6 +71,15 @@ func (b *Backend) Revision(ctx context.Context) (int64, error) {
 		return 0, mapErr(ctx, err)
 	}
 	return resp.Header.Revision, nil
+}
+
+// Identity returns the etcd cluster ID.
+func (b *Backend) Identity(ctx context.Context) (string, error) {
+	resp, err := b.cli.Get(ctx, "\x00", clientv3.WithCountOnly())
+	if err != nil {
+		return "", mapErr(ctx, err)
+	}
+	return fmt.Sprintf("etcd-%x", resp.Header.ClusterId), nil
 }
 
 // Watch implements backend.Watcher.

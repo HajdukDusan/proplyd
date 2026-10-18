@@ -88,6 +88,19 @@ func (ns *namespace) watchSession(w backend.Watcher) error {
 	}
 	ns.epoch.Store(m.epoch)
 	ns.setWrev(m.wrev)
+
+	rev, id, err := ns.e.backendState(ctx)
+	if err != nil {
+		return err
+	}
+	if reason := storeReset(m, rev, id); reason != "" {
+		return ns.rebase(ctx, reason, rev, id)
+	}
+	if m.bid == "" && id != "" {
+		if err := adoptScript.Run(ctx, ns.e.rdb, []string{ns.ks.meta}, id).Err(); err != nil {
+			return redisErr("record store identity", err)
+		}
+	}
 	ns.e.log.Debug("watch started", "namespace", ns.name, "from", m.wrev+1)
 
 	for batch := range w.Watch(ctx, ns.spec.KeyPrefix, m.wrev+1) {
@@ -118,15 +131,36 @@ func (ns *namespace) resync(ctx context.Context, compacted *backend.CompactedErr
 	}
 	ns.e.log.Warn("watch history compacted, purging namespace", "namespace", ns.name,
 		"wrev", ns.wrev.Load(), "compact_revision", compacted.CompactRevision, "revision", rev)
-	if err := ns.purge(ctx, rev); err != nil {
+	if err := ns.purge(ctx, rev, false, ""); err != nil {
 		return err
 	}
 	ns.setWrev(rev)
 	return nil
 }
 
+// rebase recovers from a store that was wiped or restored from a backup:
+// its revisions start over, so every cached entry is dropped (new epoch)
+// and floor and watch progress move back to the store's current revision.
+// Near-caches get a reset.
+func (ns *namespace) rebase(ctx context.Context, reason string, rev int64, id string) error {
+	ns.e.log.Warn("backing store was reset, rebasing namespace", "namespace", ns.name, "reason", reason, "revision", rev)
+	if err := ns.purge(ctx, rev, true, id); err != nil {
+		return err
+	}
+	ns.wrev.Store(rev)
+	ns.e.stats.StoreResets.Add(1)
+	return nil
+}
+
+// errStoreRegressed: the watch reported a revision below the recorded
+// progress. The next session start rebases the namespace.
+var errStoreRegressed = errors.New("store revision went backwards")
+
 // applyBatch applies a batch of changes, then records the progress.
 func (ns *namespace) applyBatch(ctx context.Context, batch backend.WatchBatch) error {
+	if batch.Revision < ns.wrev.Load() {
+		return errStoreRegressed
+	}
 	for attempt := 0; len(batch.Events) > 0; attempt++ {
 		if attempt == 3 {
 			return fmt.Errorf("%w: namespace epoch keeps changing", ErrCacheUnavailable)

@@ -158,10 +158,15 @@ func TestEndToEndWithEtcd(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if invs := ev.GetInvalidations(); len(invs) > 0 {
-			if invs[0].GetKey() != "n1" || invs[0].GetRevision() != resp.Header.Revision {
-				t.Fatalf("invalidation %v, want n1@%d", invs[0], resp.Header.Revision)
+		// Earlier changes (the first write) may be announced first.
+		found := false
+		for _, inv := range ev.GetInvalidations() {
+			if inv.GetKey() != "n1" || inv.GetRevision() > resp.Header.Revision {
+				t.Fatalf("unexpected invalidation %v, want n1@%d", inv, resp.Header.Revision)
 			}
+			found = found || inv.GetRevision() == resp.Header.Revision
+		}
+		if found {
 			break
 		}
 	}

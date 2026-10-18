@@ -123,6 +123,18 @@ func (f *Backend) Delete(ctx context.Context, key string) (int64, bool, error) {
 	return f.inner.Delete(ctx, key)
 }
 
+// Identity passes through to the wrapped backend, if it has one.
+func (f *Backend) Identity(ctx context.Context) (string, error) {
+	id, ok := f.inner.(backend.Identifier)
+	if !ok {
+		return "", nil
+	}
+	if err := f.before(ctx); err != nil {
+		return "", err
+	}
+	return id.Identity(ctx)
+}
+
 func (f *Backend) Revision(ctx context.Context) (int64, error) {
 	if err := f.before(ctx); err != nil {
 		return 0, err

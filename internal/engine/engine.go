@@ -149,6 +149,9 @@ type Stats struct {
 	Fills, FillsRejected              atomic.Int64
 	Writes, WatchEvents, Purges       atomic.Int64
 	RedisRestarts, NamespacesReloaded atomic.Int64
+	// StoreResets counts namespaces rebased after the backing store was
+	// wiped or restored.
+	StoreResets atomic.Int64
 }
 
 // New starts an engine.
@@ -250,11 +253,11 @@ func (e *Engine) Register(ctx context.Context, name string, spec protocol.Spec) 
 	case errors.Is(err, redis.Nil):
 		// Create it. The backend revision becomes the namespace's starting
 		// point: the watcher follows changes after it.
-		rev, err := e.backend.Revision(ctx)
+		rev, id, err := e.backendState(ctx)
 		if err != nil {
 			return protocol.Spec{}, err
 		}
-		res, err := registerScript.Run(ctx, e.rdb, []string{ks.meta}, specBytes, epochBytes(newEpoch()), rev).Slice()
+		res, err := registerScript.Run(ctx, e.rdb, []string{ks.meta}, specBytes, epochBytes(newEpoch()), rev, id).Slice()
 		if err != nil {
 			return protocol.Spec{}, redisErr("register", err)
 		}
@@ -374,6 +377,37 @@ type meta struct {
 	epoch uint64
 	floor int64
 	wrev  int64
+	bid   string // store identity, "" if unknown
+}
+
+// backendState returns the store's current revision and identity ("" if
+// the backend cannot tell).
+func (e *Engine) backendState(ctx context.Context) (int64, string, error) {
+	rev, err := e.backend.Revision(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	var id string
+	if idf, ok := e.backend.(backend.Identifier); ok {
+		if id, err = idf.Identity(ctx); err != nil {
+			return 0, "", err
+		}
+	}
+	return rev, id, nil
+}
+
+// storeReset reports why the store no longer matches what the namespace
+// cached ("" if it does): another store instance, or revisions that went
+// backwards. Either way it was wiped or restored from a backup, and cached
+// revisions no longer compare with the store's.
+func storeReset(m meta, rev int64, id string) string {
+	switch {
+	case id != "" && m.bid != "" && id != m.bid:
+		return fmt.Sprintf("store identity changed from %s to %s", m.bid, id)
+	case rev < m.wrev:
+		return fmt.Sprintf("store revision went back from %d to %d", m.wrev, rev)
+	}
+	return ""
 }
 
 func readMeta(ctx context.Context, rdb redis.UniversalClient, ks keyspace) (meta, error) {
@@ -399,6 +433,9 @@ func readMeta(ctx context.Context, rdb redis.UniversalClient, ks keyspace) (meta
 	}
 	if _, err := fmt.Sscan(res[4].(string), &m.wrev); err != nil {
 		return meta{}, fmt.Errorf("corrupt wrev in %s: %w", ks.meta, err)
+	}
+	if len(res) > 5 {
+		m.bid, _ = res[5].(string)
 	}
 	return m, nil
 }

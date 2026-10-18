@@ -22,6 +22,7 @@ import (
 //	epoch  8 random bytes; changing it kills every entry at once (purge)
 //	floor  loads that read below this revision are never installed
 //	wrev   every backend change up to this revision has been applied
+//	bid    identity of the backing store instance (see backend.Identifier)
 type keyspace struct {
 	meta, stream, lease, entryPrefix string
 }
@@ -195,31 +196,43 @@ return {1, e, redis.call('GET', KEYS[2])}
 // registerScript creates a namespace unless it exists.
 //
 // KEYS: meta
-// ARGV: spec, epoch, revision (initial floor and wrev)
+// ARGV: spec, epoch, revision (initial floor and wrev), store identity
 // Returns {created(0|1), spec, epoch}.
 var registerScript = redis.NewScript(`
 local cur = redis.call('HGET', KEYS[1], 'spec')
 if cur then return {0, cur, redis.call('HGET', KEYS[1], 'epoch')} end
-redis.call('HSET', KEYS[1], 'spec', ARGV[1], 'epoch', ARGV[2], 'floor', ARGV[3], 'wrev', ARGV[3])
+redis.call('HSET', KEYS[1], 'spec', ARGV[1], 'epoch', ARGV[2], 'floor', ARGV[3], 'wrev', ARGV[3], 'bid', ARGV[4])
 return {1, ARGV[1], ARGV[2]}
 `)
 
 // metaScript reads the namespace meta.
 //
 // KEYS: meta
-// Returns {-1} or {1, spec, epoch, floor, wrev}.
+// Returns {-1} or {1, spec, epoch, floor, wrev, bid}.
 var metaScript = redis.NewScript(`
-local m = redis.call('HMGET', KEYS[1], 'spec', 'epoch', 'floor', 'wrev')
+local m = redis.call('HMGET', KEYS[1], 'spec', 'epoch', 'floor', 'wrev', 'bid')
 if not m[1] or not m[2] then return {-1} end
-return {1, m[1], m[2], m[3] or '0', m[4] or '0'}
+return {1, m[1], m[2], m[3] or '0', m[4] or '0', m[5] or ''}
+`)
+
+// adoptScript records the store identity of a namespace that has none yet.
+//
+// KEYS: meta
+// ARGV: identity
+var adoptScript = redis.NewScript(`
+if redis.call('HEXISTS', KEYS[1], 'spec') == 0 then return -1 end
+return redis.call('HSETNX', KEYS[1], 'bid', ARGV[1])
 `)
 
 // purgeScript kills every entry of a namespace by changing its epoch, and
 // tells near-caches to reset.
 //
 // KEYS: meta, stream
-// ARGV: expected epoch, new epoch, floor, wrev, stream maxlen
-// (an empty floor or wrev keeps the current one)
+// ARGV: expected epoch, new epoch, floor, wrev, stream maxlen, rebase,
+// identity (an empty floor, wrev or identity keeps the current one)
+//
+// The floor only rises, except with rebase = '1': the store was wiped or
+// restored and its revisions start over, so floor and wrev move back.
 //
 // Returns {-1}, {-2, epoch} or {1}.
 var purgeScript = redis.NewScript(`
@@ -229,9 +242,10 @@ if e ~= ARGV[1] then return {-2, e} end
 redis.call('HSET', KEYS[1], 'epoch', ARGV[2])
 if ARGV[3] ~= '' then
   local floor = tonumber(redis.call('HGET', KEYS[1], 'floor') or '0')
-  if tonumber(ARGV[3]) > floor then redis.call('HSET', KEYS[1], 'floor', ARGV[3]) end
+  if ARGV[6] == '1' or tonumber(ARGV[3]) > floor then redis.call('HSET', KEYS[1], 'floor', ARGV[3]) end
 end
 if ARGV[4] ~= '' then redis.call('HSET', KEYS[1], 'wrev', ARGV[4]) end
+if ARGV[7] ~= '' then redis.call('HSET', KEYS[1], 'bid', ARGV[7]) end
 redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[5], '*', 'x', ARGV[2])
 return {1}
 `)
@@ -276,7 +290,7 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 `)
 
-var allScripts = []*redis.Script{installScript, getScript, registerScript, metaScript, purgeScript, wrevScript, leaseScript, releaseScript}
+var allScripts = []*redis.Script{installScript, getScript, registerScript, metaScript, purgeScript, adoptScript, wrevScript, leaseScript, releaseScript}
 
 // loadScripts loads every script into the Redis script cache.
 func loadScripts(ctx context.Context, rdb redis.UniversalClient) error {
