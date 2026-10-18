@@ -249,10 +249,6 @@ The multi-client stress, bad-network and chaos tests live in proplyd-go
 
 ## Not done yet
 
-- **Per-client invalidation filtering.** Today every subscriber gets every
-  invalidation of its namespace. On very thin links (tens of KB/s) under a
-  heavy write load, that stream alone can saturate the link. Tracking which
-  keys each client holds (like Redis client-side caching) would fix it.
 - **Batched watch apply.** The watcher runs one script per event
   (pipelined). One script per batch would raise throughput if the store's
   write rate ever outruns it; when the watcher falls behind etcd's history,
