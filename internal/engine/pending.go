@@ -64,10 +64,10 @@ func (ns *namespace) writeBehind(ctx context.Context, key string, del bool, valu
 	if del {
 		delArg = "1"
 	}
-	base := ""
+	base, seen := "", ""
 	for attempt := 0; attempt < 4; attempt++ {
 		args := []any{"", epochBytes(ns.epoch.Load()), key, delArg, value, base,
-			ns.e.opts.MaxPending, ns.e.opts.InvalidationLogSize, time.Now().UnixMilli()}
+			ns.e.opts.MaxPending, ns.e.opts.InvalidationLogSize, time.Now().UnixMilli(), seen}
 		res, err := wbWriteScript.Run(ctx, ns.e.rdb, []string{ns.ks.meta, ns.ks.entry(key), ns.ks.stream, ns.ks.pending, ns.ks.queue}, args...).Slice()
 		if err != nil {
 			return redisErr("write-behind", err)
@@ -89,6 +89,7 @@ func (ns *namespace) writeBehind(ctx context.Context, key string, del bool, valu
 			switch {
 			case err == nil:
 				base = strconv.FormatInt(item.ModRevision, 10)
+				seen = strconv.FormatInt(item.ReadRevision, 10)
 			case ctx.Err() != nil:
 				return ctx.Err()
 			default:
@@ -254,6 +255,12 @@ func encodePending(pw pendingWrite) []byte {
 // commit records a flush outcome; the cached entry becomes the flushed
 // state.
 func (ns *namespace) commit(ctx context.Context, key string, pw pendingWrite, outcome string, rev int64) error {
+	// A newer write that coalesced meanwhile is now based on the flushed
+	// state: the key at rev, or no key at all after a delete.
+	newBase := rev
+	if pw.del {
+		newBase = 0
+	}
 	now := time.Now()
 	payload, ttl := encodeEntry(kindValue, 0, rev, now, pw.value), ns.ttl()
 	if pw.del {
@@ -268,7 +275,7 @@ func (ns *namespace) commit(ctx context.Context, key string, pw pendingWrite, ou
 		epoch := ns.epoch.Load()
 		setEpoch(payload, epoch)
 		res, err := wbCommitScript.Run(ctx, ns.e.rdb, keys,
-			outcome, epochBytes(epoch), key, pw.seq, rev, payload, max(ttl.Milliseconds(), 1), ns.e.opts.InvalidationLogSize).Slice()
+			outcome, epochBytes(epoch), key, pw.seq, rev, payload, max(ttl.Milliseconds(), 1), ns.e.opts.InvalidationLogSize, newBase).Slice()
 		if err != nil {
 			return redisErr("commit write-behind flush", err)
 		}

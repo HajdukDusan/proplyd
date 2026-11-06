@@ -100,11 +100,16 @@ this file holds decisions and invariants the code does not explain.
     scripts.go). `{ns}:q` is the queue, `{ns}:n` holds flush intents and
     `{ns}:f` is the flusher lease.
   - Reads: getScript returns the pending record before the entry. A pending
-    read reports `seen` (never `base`, which is 0 for keys that were absent),
-    which keeps revisions monotonic.
+    read reports `seen` (never `base`, which is 0 for keys that were
+    absent): the newest store revision the cache knew when it was written.
+    It is not a store revision; a direct store read during an earlier flush
+    can be newer, so pending values are not ordered against store reads.
   - A write publishes r=0. A flush publishes the store revision.
   - Commit: retire the write if seq is unchanged, else rebase the newer
-    write onto the flushed revision. A conflict drops it.
+    write onto the flushed revision, or onto 0 after a delete flush (the
+    key is then absent, and CAS on the delete's revision would fail and
+    drop an acked write; `TestWriteBehindWriteDuringDeleteFlush`). A
+    conflict drops it.
   - `finishIntent` treats "the store holds the intent's value" as our own
     flush.
   - `activatePending` scans `{*}:q` at startup and every 5s.

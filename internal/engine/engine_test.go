@@ -1250,3 +1250,33 @@ func TestWriteBehindDelete(t *testing.T) {
 	}
 	storeHas(t, v, "k", "")
 }
+
+// A write arrives while a pending delete of the same key is being flushed.
+// The write coalesces into the pending record; once the delete commits it
+// must be based on "key absent" (mod revision 0), not on the delete's
+// revision, or its flush fails the compare-and-set and the acknowledged
+// write is dropped as a conflict. Found by the stress test.
+func TestWriteBehindWriteDuringDeleteFlush(t *testing.T) {
+	v := wbEnv(t, proplydtest.NoPersistence)
+	e := v.engine()
+	v.register(e, protocol.Spec{Write: protocol.WriteBehind})
+	v.put("k", "v0")
+	get(t, e, "k")
+	ctx := context.Background()
+
+	v.be.SetLatency(time.Second) // the flusher's DeleteIf will be in flight for 1s
+	if _, _, err := e.Delete(ctx, ns, "k"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond) // the flusher picked up the delete
+	v.be.SetLatency(0)
+	if _, err := e.Set(ctx, ns, "k", []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	expectValue(t, get(t, e, "k"), "v1")
+
+	storeHas(t, v, "k", "v1")
+	if n := e.Stats().FlushConflicts.Load(); n != 0 {
+		t.Fatalf("own write counted as %d conflicts (and dropped)", n)
+	}
+}

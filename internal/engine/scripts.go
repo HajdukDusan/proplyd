@@ -224,8 +224,10 @@ return {1, e, redis.call('GET', KEYS[2]), p}
 // wbWriteScript records a write-behind write.
 //
 // KEYS: meta, entry, stream, pending, queue
-// ARGV: unused, epoch, key, delete ('0'|'1'), value, base (” to derive it
-// from the cached entry), max pending keys, stream maxlen, now ms
+// ARGV: unused, epoch, key, delete ('0'|'1'), value, base, max pending
+// keys, stream maxlen, now ms, seen. An empty base is derived from the
+// cached entry; seen, if given, is the store revision the caller read the
+// base at (reads of the pending write never report less).
 //
 // Writes to a key that is already pending keep its base, so coalesced
 // writes are checked against the revision the first one saw. Returns
@@ -245,6 +247,7 @@ else
   elseif ARGV[6] ~= '' then base = tonumber(ARGV[6])
   else return {-4} end
   seen = base
+  if ARGV[10] ~= '' and tonumber(ARGV[10]) > seen then seen = tonumber(ARGV[10]) end
   if cur_kind ~= 0 and cur_rev > seen then seen = cur_rev end
   redis.call('ZADD', KEYS[5], ARGV[9], key)
 end
@@ -260,11 +263,12 @@ return {1, seq}
 //
 // KEYS: meta, entry, stream, pending, queue, intent
 // ARGV: outcome ('ok'|'conflict'), epoch, key, seq, rev, payload, ttl_ms,
-// stream maxlen
+// stream maxlen, base after the flush (rev for a put, 0 for a delete: a
+// deleted key has no mod revision)
 //
 // ok: the write is in the store at rev. It is retired if no newer write
-// arrived meanwhile; otherwise the newer write is now based on rev. The
-// cached entry becomes the flushed state.
+// arrived meanwhile; otherwise the newer write is now based on the flushed
+// state. The cached entry becomes the flushed state.
 // conflict: the store changed behind the write; the store wins. The
 // pending write (and any newer one to the key) is dropped, along with the
 // cached entry.
@@ -289,7 +293,7 @@ if rec then
     redis.call('HDEL', KEYS[4], key)
     redis.call('ZREM', KEYS[5], key)
   else
-    redis.call('HSET', KEYS[4], key, string.sub(rec, 1, 8) .. struct.pack('>i8i8', rev, rev) .. string.sub(rec, 25))
+    redis.call('HSET', KEYS[4], key, string.sub(rec, 1, 8) .. struct.pack('>i8i8', tonumber(ARGV[9]), rev) .. string.sub(rec, 25))
   end
 end
 if cur_kind == 0 or cur_kind == 3 or rev > cur_rev then
