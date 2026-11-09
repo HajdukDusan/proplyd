@@ -30,8 +30,8 @@ several can run against one Redis.
 |---|---|
 | `pkg/api/proto/proplyd.proto` | gRPC API; generated code in `pkg/api` |
 | `pkg/protocol` | Namespace spec (validation, defaults, proto conversion) and error reasons, shared with clients |
-| `pkg/backend` | `Backend`/`Watcher` interfaces; `etcd`, in-memory `memory`, fault-injecting `faulty`, and the `backendtest` conformance suite |
-| `pkg/server` | gRPC server: error mapping, health, graceful/crash shutdown. Public so it can be embedded in tests |
+| `pkg/backend` | `Backend`/`Watcher` interfaces; `etcd`, in-memory `memory`, fault-injecting `faulty`, `none` (no store, see below), and the `backendtest` conformance suite |
+| `pkg/server` | gRPC server: error mapping, health, Prometheus metrics, graceful/crash shutdown. Public so it can be embedded in tests |
 | `internal/engine` | The cache engine: Lua scripts, strategies, watcher, invalidation streams |
 | `cmd/proplyd` | Server binary |
 | `proplydtest` | Test kit: real `redis-server` you can kill/restart, TCP fault proxy, restartable nodes; `etcdtest` for embedded etcd |
@@ -193,10 +193,12 @@ proplyd -listen :7070 -redis-addrs redis:6379 -etcd-endpoints etcd-0:2379,etcd-1
 | `-redis-master` (Sentinel) | `PROPLYD_REDIS_MASTER` | |
 | `-redis-username`, `-redis-password` | `PROPLYD_REDIS_USERNAME`, `PROPLYD_REDIS_PASSWORD` | |
 | `-redis-key-prefix` | `PROPLYD_REDIS_KEY_PREFIX` | `pd:` |
+| `-backend` | `PROPLYD_BACKEND` | `etcd` (or `none`) |
 | `-etcd-endpoints` | `PROPLYD_ETCD_ENDPOINTS` | `localhost:2379` |
 | `-allowed-prefixes` | `PROPLYD_ALLOWED_PREFIXES` | any |
 | `-instance-id` | `PROPLYD_INSTANCE_ID` | hostname |
 | `-tls-cert`, `-tls-key` | `PROPLYD_TLS_CERT`, `PROPLYD_TLS_KEY` | plaintext |
+| `-metrics-listen` | `PROPLYD_METRICS_LISTEN` | off (e.g. `:9090`) |
 | `-log-level` | `PROPLYD_LOG_LEVEL` | `info` |
 | `-max-value-size`, `-load-timeout`, `-fence-ttl`, `-lease-ttl`, `-invalidation-log-size`, `-shutdown-timeout` | | 1 MiB, 5s, 30s, 5s, 10000, 30s |
 | `-flush-interval`, `-max-pending` (write-behind) | | 500ms, 100000 |
@@ -205,6 +207,28 @@ The server exposes `grpc.health.v1` and reports `NOT_SERVING` while Redis is
 unreachable, so health-checking clients skip it. SIGTERM shuts down
 gracefully: subscriptions are ended (clients resume elsewhere), in-flight
 calls finish, and watcher leases are handed back.
+
+**Without a store** (`-backend none`). For data proplyd cannot read itself,
+such as values computed from Prometheus queries, which have no change feed:
+every store call fails as unavailable, so such a proplyd serves cache-aside
+namespaces with `SyncNone`. Clients load values with their own `Backend`,
+fill the cache, and a value is at most the namespace TTL old. Registering a
+`SyncWatch` or write-behind namespace is refused.
+
+**Metrics.** With `-metrics-listen`, `/metrics` serves (Prometheus format):
+
+| Metric | |
+|---|---|
+| `proplyd_grpc_requests_total{method,code}`, `proplyd_grpc_request_duration_seconds{method}` | every call; the latency histogram resolves 0.1 ms |
+| `proplyd_cache_hits_total`, `proplyd_cache_misses_total` | reads served from Redis, and not |
+| `proplyd_backend_loads_total`, `proplyd_backend_load_errors_total`, `proplyd_backend_load_duration_seconds` | misses loaded from the store; the histogram is the time to read the key and install it |
+| `proplyd_fills_total`, `proplyd_fills_rejected_total`, `proplyd_writes_total`, `proplyd_watch_events_total` | |
+| `proplyd_subscribers`, `proplyd_subscribe_messages_total{kind}`, `proplyd_invalidations_sent_total` | invalidation streams |
+| `proplyd_purges_total`, `proplyd_redis_restarts_total`, `proplyd_store_resets_total`, `proplyd_redis_up` | recoveries |
+| `proplyd_writebehind_*_total` | write-behind writes, flushes, conflicts |
+
+plus the Go runtime and process metrics. Clients export their side (near-cache
+hits, latency by read path, breaker state) with proplyd-go's `promexport`.
 
 **Redis requirements.** Redis ≥ 7.0 or Valkey; the scripts use the bundled
 `struct` Lua library. Use `maxmemory-policy volatile-lru` (or `volatile-lfu`

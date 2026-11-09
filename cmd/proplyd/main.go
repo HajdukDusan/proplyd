@@ -3,17 +3,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/c12s/proplyd/pkg/backend"
 	"github.com/c12s/proplyd/pkg/backend/etcd"
+	"github.com/c12s/proplyd/pkg/backend/none"
 	"github.com/c12s/proplyd/pkg/server"
 	"github.com/redis/go-redis/v9"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -37,10 +41,12 @@ func run() error {
 		redisPassword   = fs.String("redis-password", env("PROPLYD_REDIS_PASSWORD", ""), "Redis password")
 		redisDB         = fs.Int("redis-db", 0, "Redis database (single node only)")
 		redisPrefix     = fs.String("redis-key-prefix", env("PROPLYD_REDIS_KEY_PREFIX", "pd:"), "prefix of every Redis key")
+		backendKind     = fs.String("backend", env("PROPLYD_BACKEND", "etcd"), "backing store: etcd, or none (cache-aside SyncNone namespaces only)")
 		etcdEndpoints   = fs.String("etcd-endpoints", env("PROPLYD_ETCD_ENDPOINTS", "localhost:2379"), "comma-separated etcd endpoints")
 		etcdDialTimeout = fs.Duration("etcd-dial-timeout", 5*time.Second, "etcd dial timeout")
 		allowed         = fs.String("allowed-prefixes", env("PROPLYD_ALLOWED_PREFIXES", ""), "comma-separated backend key prefixes namespaces may use (default: any)")
 		instanceID      = fs.String("instance-id", env("PROPLYD_INSTANCE_ID", ""), "instance ID for watcher leases (default: hostname)")
+		metricsListen   = fs.String("metrics-listen", env("PROPLYD_METRICS_LISTEN", ""), "HTTP address serving Prometheus metrics on /metrics (default: off)")
 		tlsCert         = fs.String("tls-cert", env("PROPLYD_TLS_CERT", ""), "TLS certificate file")
 		tlsKey          = fs.String("tls-key", env("PROPLYD_TLS_KEY", ""), "TLS key file")
 		logLevel        = fs.String("log-level", env("PROPLYD_LOG_LEVEL", "info"), "debug, info, warn or error")
@@ -76,18 +82,28 @@ func run() error {
 	defer rdb.Close()
 	checkEvictionPolicy(rdb, log)
 
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   splitList(*etcdEndpoints),
-		DialTimeout: *etcdDialTimeout,
-		Logger:      nil,
-	})
-	if err != nil {
-		return fmt.Errorf("etcd: %w", err)
+	var be backend.Backend
+	switch *backendKind {
+	case "etcd":
+		cli, err := clientv3.New(clientv3.Config{
+			Endpoints:   splitList(*etcdEndpoints),
+			DialTimeout: *etcdDialTimeout,
+			Logger:      nil,
+		})
+		if err != nil {
+			return fmt.Errorf("etcd: %w", err)
+		}
+		defer cli.Close()
+		be = etcd.New(cli)
+	case "none":
+		be = none.New()
+	default:
+		return fmt.Errorf("unknown backend %q (etcd or none)", *backendKind)
 	}
-	defer cli.Close()
 
 	var creds credentials.TransportCredentials
 	if *tlsCert != "" || *tlsKey != "" {
+		var err error
 		creds, err = credentials.NewServerTLSFromFile(*tlsCert, *tlsKey)
 		if err != nil {
 			return fmt.Errorf("tls: %w", err)
@@ -96,7 +112,7 @@ func run() error {
 
 	srv, err := server.New(server.Options{
 		Redis:               rdb,
-		Backend:             etcd.New(cli),
+		Backend:             be,
 		InstanceID:          *instanceID,
 		RedisKeyPrefix:      *redisPrefix,
 		AllowedPrefixes:     splitList(*allowed),
@@ -117,7 +133,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("proplyd listening", "addr", lis.Addr().String())
+	log.Info("proplyd listening", "addr", lis.Addr().String(), "backend", *backendKind)
+
+	if *metricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", srv.MetricsHandler())
+		msrv := &http.Server{Addr: *metricsListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics server", "err", err)
+			}
+		}()
+		defer msrv.Close()
+		log.Info("serving metrics", "addr", *metricsListen)
+	}
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(lis) }()

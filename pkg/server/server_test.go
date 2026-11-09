@@ -10,6 +10,7 @@ import (
 	"github.com/c12s/proplyd/pkg/backend/etcd"
 	"github.com/c12s/proplyd/pkg/backend/faulty"
 	"github.com/c12s/proplyd/pkg/backend/memory"
+	"github.com/c12s/proplyd/pkg/backend/none"
 	"github.com/c12s/proplyd/pkg/protocol"
 	"github.com/c12s/proplyd/proplydtest"
 	"github.com/c12s/proplyd/proplydtest/etcdtest"
@@ -198,4 +199,30 @@ func TestGracefulShutdownEndsSubscriptions(t *testing.T) {
 			break
 		}
 	}
+}
+
+// A proplyd without a backing store serves cache-aside namespaces: clients
+// load and fill, and the cache refuses what it cannot do.
+func TestNoBackendCacheAside(t *testing.T) {
+	f := start(t, none.New())
+	_, err := f.api.Register(ctx(t), &api.RegisterRequest{Namespace: "w", Spec: protocol.Spec{KeyPrefix: "m/"}.ToProto()})
+	expectStatus(t, err, codes.InvalidArgument, protocol.ReasonInvalidArgument)
+	register(t, f, "metrics", protocol.Spec{KeyPrefix: "m/", Read: protocol.CacheAside, Sync: protocol.SyncNone, TTL: time.Minute})
+
+	resp, err := f.api.Get(ctx(t), &api.GetRequest{Namespace: "metrics", Key: "node/n1"})
+	if err != nil || !resp.GetMiss() {
+		t.Fatalf("first read: %v %v", resp, err)
+	}
+	// Revisions of such a source are whatever orders its reads, e.g. the
+	// time of the read in milliseconds.
+	rev := time.Now().UnixMilli()
+	if _, err := f.api.Fill(ctx(t), &api.FillRequest{Namespace: "metrics", Key: "node/n1", Found: true, Value: []byte("cpu=1"), ModRevision: rev, ReadRevision: rev}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = f.api.Get(ctx(t), &api.GetRequest{Namespace: "metrics", Key: "node/n1"})
+	if err != nil || string(resp.GetValue()) != "cpu=1" || resp.GetSource() != api.Source_SOURCE_CACHE {
+		t.Fatalf("after fill: %v %v", resp, err)
+	}
+	_, err = f.api.Set(ctx(t), &api.SetRequest{Namespace: "metrics", Key: "node/n1", Value: []byte("x")})
+	expectStatus(t, err, codes.Unavailable, protocol.ReasonBackendUnavailable)
 }

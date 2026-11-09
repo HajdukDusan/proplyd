@@ -85,7 +85,10 @@ type Options struct {
 	// MaxPending bounds the keys waiting to be flushed per namespace; new
 	// keys are refused beyond it (ErrBackpressure). Default 100000.
 	MaxPending int
-	Logger     *slog.Logger
+	// ObserveLoad, if set, is called after every successful backend load
+	// with the time it took to read the key and install it in Redis.
+	ObserveLoad func(time.Duration)
+	Logger      *slog.Logger
 }
 
 func (o *Options) setDefaults() error {

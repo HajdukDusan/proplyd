@@ -329,6 +329,7 @@ func (ns *namespace) loadAndInstall(key string) (backend.Item, error) {
 	ctx, cancel := context.WithTimeout(ns.ctx, ns.e.opts.LoadTimeout)
 	defer cancel()
 	ns.e.stats.Loads.Add(1)
+	start := time.Now()
 	item, err := ns.e.backend.Get(ctx, ns.spec.KeyPrefix+key)
 	if err != nil {
 		ns.e.stats.LoadErrors.Add(1)
@@ -337,6 +338,9 @@ func (ns *namespace) loadAndInstall(key string) (backend.Item, error) {
 	if _, err := ns.installItem(ctx, key, item); err != nil && !errors.Is(err, context.Canceled) {
 		// The read itself succeeded; serve it uncached.
 		ns.e.log.Debug("install after load failed", "namespace", ns.name, "key", key, "err", err)
+	}
+	if obs := ns.e.opts.ObserveLoad; obs != nil {
+		obs(time.Since(start))
 	}
 	return item, nil
 }

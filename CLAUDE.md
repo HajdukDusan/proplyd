@@ -116,3 +116,13 @@ this file holds decisions and invariants the code does not explain.
   - Purges and rebases never touch pending writes.
 - Redis restart detection: `run_id` change → `reloadAll` (stop and forget
   every namespace; the next request re-activates and the watch replays).
+- **Metrics** (`pkg/server/metrics.go`, added 2026-11-09; the user chose
+  `/metrics` endpoints over measuring from outside): each Server has its own
+  registry (several servers run in one test process). gRPC interceptors
+  count calls, `engineCollector` reads `engine.Stats` at scrape time, and
+  `engine.Options.ObserveLoad` times read + install of every backend load.
+  `New` builds the Server before the engine because the hook closes over it.
+- **`backend/none`**: every call fails with ErrUnavailable and Revision is 0
+  (floor 0, so fills at any revision work). It exists for c12s's Prometheus
+  metrics (cache-aside, SyncNone, TTL 5s); Register refuses SyncWatch and
+  write-behind on it through the existing Watcher/CondWriter checks.

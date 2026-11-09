@@ -56,10 +56,11 @@ type Options struct {
 type Server struct {
 	api.UnimplementedCacheServiceServer
 
-	engine *engine.Engine
-	grpc   *grpc.Server
-	health *health.Server
-	log    *slog.Logger
+	engine  *engine.Engine
+	grpc    *grpc.Server
+	metrics *metrics
+	health  *health.Server
+	log     *slog.Logger
 
 	stopHealth context.CancelFunc
 	healthDone chan struct{}
@@ -72,6 +73,12 @@ func New(opts Options) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	s := &Server{
+		health:     health.NewServer(),
+		log:        log,
+		healthDone: make(chan struct{}),
+	}
+	s.metrics = newMetrics(s)
 	eng, err := engine.New(engine.Options{
 		Redis:               opts.Redis,
 		Backend:             opts.Backend,
@@ -90,11 +97,13 @@ func New(opts Options) (*Server, error) {
 		FlushInterval:       opts.FlushInterval,
 		FlushBatch:          opts.FlushBatch,
 		MaxPending:          opts.MaxPending,
+		ObserveLoad:         func(d time.Duration) { s.metrics.loads.Observe(d.Seconds()) },
 		Logger:              log,
 	})
 	if err != nil {
 		return nil, err
 	}
+	s.engine = eng
 	maxMsg := opts.MaxValueSize
 	if maxMsg <= 0 {
 		maxMsg = 1 << 20
@@ -109,13 +118,8 @@ func New(opts Options) (*Server, error) {
 	if opts.TLS != nil {
 		gopts = append(gopts, grpc.Creds(opts.TLS))
 	}
-	s := &Server{
-		engine:     eng,
-		grpc:       grpc.NewServer(gopts...),
-		health:     health.NewServer(),
-		log:        log,
-		healthDone: make(chan struct{}),
-	}
+	gopts = append(gopts, grpc.ChainUnaryInterceptor(s.metrics.unary), grpc.ChainStreamInterceptor(s.metrics.stream))
+	s.grpc = grpc.NewServer(gopts...)
 	api.RegisterCacheServiceServer(s.grpc, s)
 	healthpb.RegisterHealthServer(s.grpc, s.health)
 
@@ -252,7 +256,14 @@ func (s *Server) Invalidate(ctx context.Context, req *api.InvalidateRequest) (*a
 }
 
 func (s *Server) Subscribe(req *api.SubscribeRequest, stream grpc.ServerStreamingServer[api.SubscribeResponse]) error {
-	err := s.engine.Subscribe(stream.Context(), req.GetNamespace(), req.GetEpoch(), req.GetPosition(), stream.Send)
+	send := func(r *api.SubscribeResponse) error {
+		if err := stream.Send(r); err != nil {
+			return err
+		}
+		s.metrics.sent(r)
+		return nil
+	}
+	err := s.engine.Subscribe(stream.Context(), req.GetNamespace(), req.GetEpoch(), req.GetPosition(), send)
 	if err != nil {
 		return s.toStatus(err)
 	}
